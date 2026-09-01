@@ -14,7 +14,7 @@
 
 const { executeDirectSQL } = require('../utils/postgresExecutor');
 const { fetchExclusionPatterns } = require('./exclusionPatternService');
-const { getSupabaseAdmin } = require('../config/database');
+const { getPool } = require('../config/database');
 
 /**
  * Get timezone abbreviation (CST/CDT/EST/etc.) from IANA timezone name.
@@ -119,7 +119,7 @@ let _progressBarColorsCacheTime = 0;
 const PROGRESS_COLORS_CACHE_TTL = 0;
 
 /**
- * Fetch progress bar colors from system_config table in Supabase.
+ * Fetch progress bar colors from system_config table.
  * Returns a map like { loading: '#FFC107', to_job: '#2196F3', ... }
  * Fully dynamic — returns only DB colors, no hardcoded defaults.
  */
@@ -129,14 +129,14 @@ async function fetchProgressBarColors() {
     return _progressBarColorsCache;
   }
   try {
-    const supabase = getSupabaseAdmin();
-    const { data, error } = await supabase
-      .from('system_config')
-      .select('config_value')
-      .eq('config_key', 'progress_bar_colors')
-      .single();
+    const pool = getPool();
+    const { rows } = await pool.query(
+      'SELECT config_value FROM system_config WHERE config_key = $1 LIMIT 1',
+      ['progress_bar_colors']
+    );
 
-    if (error || !data) return {};
+    const data = rows[0] || null;
+    if (!data) return {};
 
     const parsed = typeof data.config_value === 'string'
       ? JSON.parse(data.config_value)
@@ -165,14 +165,14 @@ async function fetchTrackingStatusColors() {
     return _trackingStatusColorsCache;
   }
   try {
-    const supabase = getSupabaseAdmin();
-    const { data, error } = await supabase
-      .from('system_config')
-      .select('config_value')
-      .eq('config_key', 'progress_bar_colors')
-      .single();
+    const pool = getPool();
+    const { rows } = await pool.query(
+      'SELECT config_value FROM system_config WHERE config_key = $1 LIMIT 1',
+      ['progress_bar_colors']
+    );
 
-    if (error || !data) return {};
+    const data = rows[0] || null;
+    if (!data) return {};
 
     const parsed = typeof data.config_value === 'string'
       ? JSON.parse(data.config_value)
@@ -1866,7 +1866,7 @@ async function getOrderByCodeAndDate(orderCode, orderDate, tz = null, loadsPagin
   // Uses extract(epoch) for unambiguous UTC timestamps — avoids pg driver timezone parsing issues
   // CRITICAL ordering: match the web's fetchProductSchedule exactly.
   //
-  // Web uses Supabase `.from("order_products").eq("order_id", ...)` with a
+  // Web uses `.from("order_products").eq("order_id", ...)` with a
   // nested `order_product_schedules(...)` relation and NO explicit ordering
   // (see orderTabDataActions.ts fetchProductSchedule lines 145-315). That
   // returns rows in PostgREST default order — which is primary-key ASC for
@@ -1952,7 +1952,7 @@ async function getOrderByCodeAndDate(orderCode, orderDate, tz = null, loadsPagin
     INNER JOIN orders o ON o.order_id = t.order_id
     LEFT JOIN LATERAL (
       -- Deterministic: web uses Array.find(p => p.is_mix === true) which
-      -- picks the FIRST is_mix product in Supabase's default (physical/
+      -- picks the FIRST is_mix product in PostgreSQL's default (physical/
       -- insertion) order — effectively id ASC on a fresh table. ORDER BY
       -- tp2.id ASC makes the backend pick the same row the web would,
       -- eliminating a non-deterministic source of load_qty drift when a

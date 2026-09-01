@@ -10,26 +10,26 @@
 const crypto = require('crypto');
 const ticketService = require('./ticketService');
 const truckService = require('./truckService');
-const { getSupabaseAdmin } = require('../config/database');
-const { getAuthSupabaseAdmin } = require('../config/authDatabase');
+const { getPool } = require('../config/database');
+const { getAuthPool } = require('../config/authDatabase');
 
 /**
  * Fetch all ticket_products for a given ticket_code and attach to ticket object.
  */
 async function enrichTicketProducts(ticket, ticketCode) {
   try {
-    const supabase = getSupabaseAdmin();
-    const { data: tRow } = await supabase
-      .from('tickets')
-      .select('ticket_id, order_id, verifi_json')
-      .eq('ticket_code', ticketCode)
-      .limit(1)
-      .maybeSingle();
+    const pool = getPool();
+    const { rows: tRows } = await pool.query(
+      'SELECT ticket_id, order_id, verifi_json FROM tickets WHERE ticket_code = $1 LIMIT 1',
+      [ticketCode]
+    );
+    const tRow = tRows[0] || null;
     if (tRow?.ticket_id) {
-      const { data: products } = await supabase
-        .from('ticket_products')
-        .select('id, ticket_id, item_code, description, short_description, is_mix, is_assoc, load_qty, delv_qty, delv_qty_unit, order_qty, order_qty_unit, ticket_qty, ticket_qty_unit, acc_delv_qty, slump')
-        .eq('ticket_id', tRow.ticket_id);
+      const { rows: products } = await pool.query(
+        `SELECT id, ticket_id, item_code, description, short_description, is_mix, is_assoc, load_qty, delv_qty, delv_qty_unit, order_qty, order_qty_unit, ticket_qty, ticket_qty_unit, acc_delv_qty, slump
+         FROM ticket_products WHERE ticket_id = $1`,
+        [tRow.ticket_id]
+      );
       ticket.ticket_products = products || [];
 
       // Set slump matching web priority: verifi_json → order_products → ticket_products
@@ -42,13 +42,11 @@ async function enrichTicketProducts(ticket, ticketCode) {
         }
       }
       if (ticket.slump == null && tRow.order_id) {
-        const { data: opRow } = await supabase
-          .from('order_products')
-          .select('slump')
-          .eq('order_id', tRow.order_id)
-          .not('slump', 'is', null)
-          .limit(1)
-          .maybeSingle();
+        const { rows: opRows } = await pool.query(
+          'SELECT slump FROM order_products WHERE order_id = $1 AND slump IS NOT NULL LIMIT 1',
+          [tRow.order_id]
+        );
+        const opRow = opRows[0] || null;
         if (opRow?.slump) ticket.slump = opRow.slump;
       }
       if (ticket.slump == null && products?.length > 0) {
@@ -202,46 +200,37 @@ async function getTenantQrSettings(userAccess) {
   if (!userAccess?.id) return null;
 
   try {
-    const supabase = getAuthSupabaseAdmin();
+    const authPool = getAuthPool();
 
     // Step 1: Resolve UUID → integer user id in auth_tenant.users
     let numericUserId = null;
     if (typeof userAccess.id === 'number' || /^\d+$/.test(userAccess.id)) {
       numericUserId = Number(userAccess.id);
     } else {
-      const { data: uData } = await supabase
-        .schema('auth_tenant')
-        .from('users')
-        .select('id')
-        .eq('uuid', userAccess.id)
-        .is('deleted_at', null)
-        .limit(1);
+      const { rows: uData } = await authPool.query(
+        'SELECT id FROM auth_tenant.users WHERE uuid = $1 AND deleted_at IS NULL LIMIT 1',
+        [userAccess.id]
+      );
 
       if (!uData || uData.length === 0) return null;
       numericUserId = uData[0].id;
     }
 
     // Step 2: Get tenant_id from tenant_users
-    const { data: tuData } = await supabase
-      .schema('auth_tenant')
-      .from('tenant_users')
-      .select('tenant_id')
-      .eq('user_id', numericUserId)
-      .eq('status', 'active')
-      .limit(1);
+    const { rows: tuData } = await authPool.query(
+      'SELECT tenant_id FROM auth_tenant.tenant_users WHERE user_id = $1 AND status = $2 LIMIT 1',
+      [numericUserId, 'active']
+    );
 
     if (!tuData || tuData.length === 0) return null;
 
     // Step 3: Get QR-related tenant columns
-    const { data: tData, error: tError } = await supabase
-      .schema('auth_tenant')
-      .from('tenants')
-      .select('qr_enabled, qr_mode, security_mode')
-      .eq('id', tuData[0].tenant_id)
-      .is('deleted_at', null)
-      .limit(1);
+    const { rows: tData } = await authPool.query(
+      'SELECT qr_enabled, qr_mode, security_mode FROM auth_tenant.tenants WHERE id = $1 AND deleted_at IS NULL LIMIT 1',
+      [tuData[0].tenant_id]
+    );
 
-    if (tError || !tData || tData.length === 0) return null;
+    if (!tData || tData.length === 0) return null;
 
     const t = tData[0];
     return {
@@ -336,14 +325,12 @@ async function verifyQrPayload(payload, userAccess) {
       // Try by order code — look up order_id from orders table
       if (qrData.orderCode) {
         try {
-          const supabase = getSupabaseAdmin();
-          const { data: orderRow } = await supabase
-            .from('orders')
-            .select('order_id')
-            .eq('order_code', qrData.orderCode)
-            .order('order_date', { ascending: false })
-            .limit(1)
-            .maybeSingle();
+          const pool = getPool();
+          const { rows: orderRows } = await pool.query(
+            'SELECT order_id FROM orders WHERE order_code = $1 ORDER BY order_date DESC LIMIT 1',
+            [qrData.orderCode]
+          );
+          const orderRow = orderRows[0] || null;
 
           if (orderRow?.order_id) {
             console.log('[QR] Found order_id via order_code:', qrData.orderCode, '→', orderRow.order_id);
@@ -378,22 +365,22 @@ async function verifyQrPayload(payload, userAccess) {
       // Fallback: direct DB lookup by ticket_code (no date filter)
       if (qrData.ticketCode) {
         try {
-          const supabase = getSupabaseAdmin();
-          const { data: ticketRow, error: ticketErr } = await supabase
-            .from('tickets')
-            .select('*')
-            .eq('ticket_code', qrData.ticketCode)
-            .limit(1)
-            .maybeSingle();
+          const pool = getPool();
+          const { rows: ticketRows } = await pool.query(
+            'SELECT * FROM tickets WHERE ticket_code = $1 LIMIT 1',
+            [qrData.ticketCode]
+          );
+          const ticketRow = ticketRows[0] || null;
 
-          if (!ticketErr && ticketRow) {
-            console.log('[QR] ✅ Ticket found via direct DB lookup:', ticketRow.ticket_code);
+          if (ticketRow) {
+            console.log('[QR] Ticket found via direct DB lookup:', ticketRow.ticket_code);
 
             // Get ALL product info for this ticket
-            const { data: allProductRows } = await supabase
-              .from('ticket_products')
-              .select('id, ticket_id, item_code, description, short_description, is_mix, is_assoc, load_qty, delv_qty, delv_qty_unit, order_qty, order_qty_unit, ticket_qty, ticket_qty_unit, acc_delv_qty, slump')
-              .eq('ticket_id', ticketRow.ticket_id);
+            const { rows: allProductRows } = await pool.query(
+              `SELECT id, ticket_id, item_code, description, short_description, is_mix, is_assoc, load_qty, delv_qty, delv_qty_unit, order_qty, order_qty_unit, ticket_qty, ticket_qty_unit, acc_delv_qty, slump
+               FROM ticket_products WHERE ticket_id = $1`,
+              [ticketRow.ticket_id]
+            );
             const productRow = (allProductRows || []).find(p => p.is_mix) || (allProductRows || [])[0];
             const productName = productRow?.item_code || null;
             const loadQty = productRow
@@ -403,23 +390,20 @@ async function verifyQrPayload(payload, userAccess) {
             // Get truck description and plant address
             let truckDesc = null;
             if (ticketRow.truck_code) {
-              const { data: truckRow } = await supabase
-                .from('trucks')
-                .select('description')
-                .eq('code', ticketRow.truck_code)
-                .limit(1)
-                .maybeSingle();
-              truckDesc = truckRow?.description || null;
+              const { rows: truckRows } = await pool.query(
+                'SELECT description FROM trucks WHERE code = $1 LIMIT 1',
+                [ticketRow.truck_code]
+              );
+              truckDesc = truckRows[0]?.description || null;
             }
 
             let plantAddress = null;
             if (ticketRow.plant_code) {
-              const { data: plantRow } = await supabase
-                .from('plants')
-                .select('address1, address2, address3')
-                .eq('code', ticketRow.plant_code)
-                .limit(1)
-                .maybeSingle();
+              const { rows: plantRows } = await pool.query(
+                'SELECT address1, address2, address3 FROM plants WHERE code = $1 LIMIT 1',
+                [ticketRow.plant_code]
+              );
+              const plantRow = plantRows[0] || null;
               if (plantRow) {
                 plantAddress = [plantRow.address1, plantRow.address2, plantRow.address3]
                   .filter(Boolean).join(', ') || null;
@@ -430,23 +414,18 @@ async function verifyQrPayload(payload, userAccess) {
             let orderRow = null;
             let orderSlump = null;
             if (ticketRow.order_id) {
-              const { data: oRow } = await supabase
-                .from('orders')
-                .select('ordered_by_name, ordered_by_phone, purchase_order, customer_job')
-                .eq('order_id', ticketRow.order_id)
-                .limit(1)
-                .maybeSingle();
-              orderRow = oRow;
+              const { rows: oRows } = await pool.query(
+                'SELECT ordered_by_name, ordered_by_phone, purchase_order, customer_job FROM orders WHERE order_id = $1 LIMIT 1',
+                [ticketRow.order_id]
+              );
+              orderRow = oRows[0] || null;
 
               // Get slump from order_products as fallback (ticket_products.slump may be null)
-              const { data: opRow } = await supabase
-                .from('order_products')
-                .select('slump')
-                .eq('order_id', ticketRow.order_id)
-                .eq('is_mix', true)
-                .limit(1)
-                .maybeSingle();
-              orderSlump = opRow?.slump || null;
+              const { rows: opRows } = await pool.query(
+                'SELECT slump FROM order_products WHERE order_id = $1 AND is_mix = true LIMIT 1',
+                [ticketRow.order_id]
+              );
+              orderSlump = opRows[0]?.slump || null;
             }
 
             // Build ticket details
@@ -615,39 +594,30 @@ async function getTenantInfo(userAccess) {
   if (!userAccess?.id) return null;
 
   try {
-    const supabase = getAuthSupabaseAdmin();
+    const authPool = getAuthPool();
 
     let numericUserId = null;
     if (typeof userAccess.id === 'number' || /^\d+$/.test(userAccess.id)) {
       numericUserId = Number(userAccess.id);
     } else {
-      const { data: uData } = await supabase
-        .schema('auth_tenant')
-        .from('users')
-        .select('id')
-        .eq('uuid', userAccess.id)
-        .is('deleted_at', null)
-        .limit(1);
+      const { rows: uData } = await authPool.query(
+        'SELECT id FROM auth_tenant.users WHERE uuid = $1 AND deleted_at IS NULL LIMIT 1',
+        [userAccess.id]
+      );
       if (!uData || uData.length === 0) return null;
       numericUserId = uData[0].id;
     }
 
-    const { data: tuData } = await supabase
-      .schema('auth_tenant')
-      .from('tenant_users')
-      .select('tenant_id')
-      .eq('user_id', numericUserId)
-      .eq('status', 'active')
-      .limit(1);
+    const { rows: tuData } = await authPool.query(
+      'SELECT tenant_id FROM auth_tenant.tenant_users WHERE user_id = $1 AND status = $2 LIMIT 1',
+      [numericUserId, 'active']
+    );
     if (!tuData || tuData.length === 0) return null;
 
-    const { data: tData } = await supabase
-      .schema('auth_tenant')
-      .from('tenants')
-      .select('id, uuid, name, subdomain, status, qr_user_active')
-      .eq('id', tuData[0].tenant_id)
-      .is('deleted_at', null)
-      .limit(1);
+    const { rows: tData } = await authPool.query(
+      'SELECT id, uuid, name, subdomain, status, qr_user_active FROM auth_tenant.tenants WHERE id = $1 AND deleted_at IS NULL LIMIT 1',
+      [tuData[0].tenant_id]
+    );
     if (!tData || tData.length === 0) return null;
 
     const t = tData[0];

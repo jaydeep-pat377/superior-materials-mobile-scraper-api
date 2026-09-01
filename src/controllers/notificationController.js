@@ -1,6 +1,6 @@
 const notificationService = require('../services/notificationService');
 const deviceService = require('../services/deviceService');
-const { getSupabase } = require('../config/database');
+const { getPool } = require('../config/database');
 
 /**
  * Batch check device tokens in database (fixes N+1 query issue)
@@ -13,21 +13,17 @@ async function batchCheckDeviceTokensInDatabase(deviceTokens) {
       return {};
     }
 
-    const supabase = getSupabase();
-    const { data, error } = await supabase
-      .from('user_devices')
-      .select('id, user_id, device_id, device_token, device_name, device_type, is_active')
-      .in('device_token', deviceTokens)
-      .eq('is_active', true);
-
-    if (error) {
-      console.error('⚠️  Error batch checking device tokens:', error.message);
-      return {};
-    }
+    const pool = getPool();
+    const { rows } = await pool.query(
+      `SELECT id, user_id, device_id, device_token, device_name, device_type, is_active
+       FROM user_devices
+       WHERE device_token = ANY($1) AND is_active = true`,
+      [deviceTokens]
+    );
 
     // Create map for quick lookup
     const tokenMap = {};
-    (data || []).forEach(device => {
+    (rows || []).forEach(device => {
       tokenMap[device.device_token] = device;
     });
 
@@ -45,20 +41,16 @@ async function batchCheckDeviceTokensInDatabase(deviceTokens) {
  */
 async function checkDeviceTokenInDatabase(deviceToken) {
   try {
-    const supabase = getSupabase();
-    const { data, error } = await supabase
-      .from('user_devices')
-      .select('id, user_id, device_id, device_token, device_name, device_type, is_active')
-      .eq('device_token', deviceToken)
-      .eq('is_active', true)
-      .single();
+    const pool = getPool();
+    const { rows } = await pool.query(
+      `SELECT id, user_id, device_id, device_token, device_name, device_type, is_active
+       FROM user_devices
+       WHERE device_token = $1 AND is_active = true
+       LIMIT 1`,
+      [deviceToken]
+    );
 
-    if (error && error.code !== 'PGRST116') {
-      console.error('⚠️  Error checking device token in database:', error.message);
-      return null;
-    }
-
-    return data || null;
+    return rows[0] || null;
   } catch (error) {
     console.error('⚠️  Error checking device token:', error.message);
     return null;

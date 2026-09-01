@@ -1,21 +1,19 @@
-const { getSupabaseAdmin } = require('../config/database');
+const { getPool } = require('../config/database');
 
 /**
  * Get plant_ids for a user based on their roles
- * Flow: user_id → user_roles → role_plants → plant_ids
+ * Flow: user_id -> user_roles -> role_plants -> plant_ids
  * @param {string} userId - User UUID
  * @returns {Array<number>} Array of plant_ids the user has access to
  */
 async function getUserPlantIds(userId) {
-  const supabase = getSupabaseAdmin();
+  const pool = getPool();
 
   // Get role_ids for the user from user_roles table
-  const { data: userRoles, error: userRolesError } = await supabase
-    .from('user_roles')
-    .select('role_id')
-    .eq('user_id', userId);
-
-  if (userRolesError) throw new Error(`Failed to fetch user roles: ${userRolesError.message}`);
+  const { rows: userRoles } = await pool.query(
+    'SELECT role_id FROM user_roles WHERE user_id = $1',
+    [userId]
+  );
 
   if (!userRoles || userRoles.length === 0) {
     return [];
@@ -24,12 +22,10 @@ async function getUserPlantIds(userId) {
   const roleIds = userRoles.map(ur => ur.role_id);
 
   // Get plant_ids for those roles from role_plants table
-  const { data: rolePlants, error: rolePlantsError } = await supabase
-    .from('role_plants')
-    .select('plant_id')
-    .in('role_id', roleIds);
-
-  if (rolePlantsError) throw new Error(`Failed to fetch role plants: ${rolePlantsError.message}`);
+  const { rows: rolePlants } = await pool.query(
+    'SELECT plant_id FROM role_plants WHERE role_id = ANY($1)',
+    [roleIds]
+  );
 
   if (!rolePlants || rolePlants.length === 0) {
     return [];
@@ -51,7 +47,7 @@ async function getUserPlantIds(userId) {
  * @returns {Object} { announcements, total, page, limit, totalPages, userPlantIds }
  */
 async function getAnnouncementsForUser(userId, filters = {}, page = 1, limit = 50) {
-  const supabase = getSupabaseAdmin();
+  const pool = getPool();
 
   // Get user's plant_ids
   const userPlantIds = await getUserPlantIds(userId);
@@ -67,43 +63,52 @@ async function getAnnouncementsForUser(userId, filters = {}, page = 1, limit = 5
     };
   }
 
-  const from = (page - 1) * limit;
-  const to = from + limit - 1;
+  const offset = (page - 1) * limit;
   const now = new Date().toISOString();
 
   // Build query for published announcements
   // that have at least one plant_id matching user's plant_ids
-  let query = supabase
-    .from('announcements')
-    .select('*', { count: 'exact' })
-    .eq('published', true)
-    .overlaps('plant_ids', userPlantIds);
+  let conditions = 'WHERE published = true AND plant_ids && $1';
+  const params = [userPlantIds];
+  let paramIdx = 2;
 
   // Filter by active status (current date within start_date and end_date)
   if (filters.active === true) {
     // Active: start_date <= now AND end_date >= now (or null)
-    query = query
-      .or(`start_date.is.null,start_date.lte.${now}`)
-      .or(`end_date.is.null,end_date.gte.${now}`);
+    conditions += ` AND (start_date IS NULL OR start_date <= $${paramIdx})`;
+    params.push(now);
+    paramIdx++;
+    conditions += ` AND (end_date IS NULL OR end_date >= $${paramIdx})`;
+    params.push(now);
+    paramIdx++;
   } else if (filters.active === false) {
     // Inactive: start_date > now OR end_date < now
-    query = query
-      .or(`start_date.gt.${now},end_date.lt.${now}`);
+    conditions += ` AND (start_date > $${paramIdx} OR end_date < $${paramIdx})`;
+    params.push(now);
+    paramIdx++;
   }
   // If filters.active is undefined, return all (no date filter)
 
-  const { data, error, count } = await query
-    .order('created_at', { ascending: false })
-    .range(from, to);
+  // Get total count
+  const countResult = await pool.query(
+    `SELECT COUNT(*) AS total FROM announcements ${conditions}`,
+    params
+  );
+  const total = parseInt(countResult.rows[0].total, 10);
 
-  if (error) throw new Error(`Failed to fetch announcements: ${error.message}`);
+  // Get paginated data
+  const dataParams = [...params, limit, offset];
+  const { rows } = await pool.query(
+    `SELECT * FROM announcements ${conditions} ORDER BY created_at DESC LIMIT $${paramIdx} OFFSET $${paramIdx + 1}`,
+    dataParams
+  );
 
   return {
-    announcements: data || [],
-    total: count || 0,
+    announcements: rows || [],
+    total,
     page,
     limit,
-    totalPages: Math.ceil((count || 0) / limit),
+    totalPages: Math.ceil(total / limit),
     userPlantIds
   };
 }
@@ -119,46 +124,59 @@ async function getAnnouncementsForUser(userId, filters = {}, page = 1, limit = 5
  * @returns {Object} { announcements, total, page, limit, totalPages }
  */
 async function getAnnouncements(filters = {}, page = 1, limit = 50) {
-  const supabase = getSupabaseAdmin();
+  const pool = getPool();
 
-  const from = (page - 1) * limit;
-  const to = from + limit - 1;
+  const offset = (page - 1) * limit;
 
-  let query = supabase
-    .from('announcements')
-    .select('*', { count: 'exact' });
+  let conditions = 'WHERE 1=1';
+  const params = [];
+  let paramIdx = 1;
 
   // Filter by published status
   if (filters.published !== undefined) {
-    query = query.eq('published', filters.published);
+    conditions += ` AND published = $${paramIdx}`;
+    params.push(filters.published);
+    paramIdx++;
   }
 
   // Filter by plant_id (check if plant_id is in plant_ids array)
   if (filters.plant_id) {
-    query = query.contains('plant_ids', [parseInt(filters.plant_id, 10)]);
+    conditions += ` AND plant_ids @> $${paramIdx}`;
+    params.push([parseInt(filters.plant_id, 10)]);
+    paramIdx++;
   }
 
   // Filter by active announcements (current date between start_date and end_date)
   if (filters.active) {
     const now = new Date().toISOString();
-    query = query
-      .or(`start_date.is.null,start_date.lte.${now}`)
-      .or(`end_date.is.null,end_date.gte.${now}`);
+    conditions += ` AND (start_date IS NULL OR start_date <= $${paramIdx})`;
+    params.push(now);
+    paramIdx++;
+    conditions += ` AND (end_date IS NULL OR end_date >= $${paramIdx})`;
+    params.push(now);
+    paramIdx++;
   }
 
-  // Apply pagination and ordering
-  const { data, error, count } = await query
-    .order('created_at', { ascending: false })
-    .range(from, to);
+  // Get total count
+  const countResult = await pool.query(
+    `SELECT COUNT(*) AS total FROM announcements ${conditions}`,
+    params
+  );
+  const total = parseInt(countResult.rows[0].total, 10);
 
-  if (error) throw new Error(`Failed to fetch announcements: ${error.message}`);
+  // Get paginated data
+  const dataParams = [...params, limit, offset];
+  const { rows } = await pool.query(
+    `SELECT * FROM announcements ${conditions} ORDER BY created_at DESC LIMIT $${paramIdx} OFFSET $${paramIdx + 1}`,
+    dataParams
+  );
 
   return {
-    announcements: data || [],
-    total: count || 0,
+    announcements: rows || [],
+    total,
     page,
     limit,
-    totalPages: Math.ceil((count || 0) / limit)
+    totalPages: Math.ceil(total / limit)
   };
 }
 
@@ -168,22 +186,14 @@ async function getAnnouncements(filters = {}, page = 1, limit = 50) {
  * @returns {Object} Announcement object
  */
 async function getAnnouncementById(id) {
-  const supabase = getSupabaseAdmin();
+  const pool = getPool();
 
-  const { data, error } = await supabase
-    .from('announcements')
-    .select('*')
-    .eq('id', id)
-    .single();
+  const { rows } = await pool.query(
+    'SELECT * FROM announcements WHERE id = $1 LIMIT 1',
+    [id]
+  );
 
-  if (error) {
-    if (error.code === 'PGRST116') {
-      return null;
-    }
-    throw new Error(`Failed to fetch announcement: ${error.message}`);
-  }
-
-  return data;
+  return rows[0] || null;
 }
 
 /**
@@ -192,17 +202,19 @@ async function getAnnouncementById(id) {
  * @returns {Object} Created announcement
  */
 async function createAnnouncement(announcementData) {
-  const supabase = getSupabaseAdmin();
+  const pool = getPool();
 
-  const { data, error } = await supabase
-    .from('announcements')
-    .insert([announcementData])
-    .select()
-    .single();
+  const keys = Object.keys(announcementData);
+  const values = Object.values(announcementData);
+  const placeholders = keys.map((_, i) => `$${i + 1}`).join(', ');
+  const columns = keys.join(', ');
 
-  if (error) throw new Error(`Failed to create announcement: ${error.message}`);
+  const { rows } = await pool.query(
+    `INSERT INTO announcements (${columns}) VALUES (${placeholders}) RETURNING *`,
+    values
+  );
 
-  return data;
+  return rows[0];
 }
 
 /**
@@ -212,23 +224,18 @@ async function createAnnouncement(announcementData) {
  * @returns {Object} Updated announcement
  */
 async function updateAnnouncement(id, announcementData) {
-  const supabase = getSupabaseAdmin();
+  const pool = getPool();
 
-  const { data, error } = await supabase
-    .from('announcements')
-    .update(announcementData)
-    .eq('id', id)
-    .select()
-    .single();
+  const keys = Object.keys(announcementData);
+  const values = Object.values(announcementData);
+  const setClauses = keys.map((key, i) => `${key} = $${i + 1}`).join(', ');
 
-  if (error) {
-    if (error.code === 'PGRST116') {
-      return null;
-    }
-    throw new Error(`Failed to update announcement: ${error.message}`);
-  }
+  const { rows } = await pool.query(
+    `UPDATE announcements SET ${setClauses} WHERE id = $${keys.length + 1} RETURNING *`,
+    [...values, id]
+  );
 
-  return data;
+  return rows[0] || null;
 }
 
 /**
@@ -237,14 +244,12 @@ async function updateAnnouncement(id, announcementData) {
  * @returns {boolean} True if deleted successfully
  */
 async function deleteAnnouncement(id) {
-  const supabase = getSupabaseAdmin();
+  const pool = getPool();
 
-  const { error } = await supabase
-    .from('announcements')
-    .delete()
-    .eq('id', id);
-
-  if (error) throw new Error(`Failed to delete announcement: ${error.message}`);
+  await pool.query(
+    'DELETE FROM announcements WHERE id = $1',
+    [id]
+  );
 
   return true;
 }

@@ -6,7 +6,7 @@
  * Admin gating is enforced at the route layer via req.user.isAdmin.
  */
 
-import { supabaseServer } from './_supabase.mjs';
+import pool from './_db.mjs';
 import {
   getAiSettings,
   getMonthToDateTokens,
@@ -70,16 +70,18 @@ export async function updateConfig(userId, body = {}) {
   };
 }
 
-/** Resolve a set of user ids to { email, name } via the auth admin API. */
+/** Resolve a set of user ids to { email, name } via the users table. */
 async function resolveUsers(ids) {
   const map = {};
   if (ids.size === 0) return map;
   try {
-    const { data } = await supabaseServer.auth.admin.listUsers({ page: 1, perPage: 1000 });
-    for (const u of data?.users ?? []) {
-      if (!ids.has(u.id)) continue;
-      const meta = u.user_metadata ?? {};
-      const name = meta.full_name || meta.name || u.email || u.id;
+    const idArray = [...ids];
+    const { rows } = await pool.query(
+      'SELECT id, email, full_name, name FROM users WHERE id = ANY($1)',
+      [idArray],
+    );
+    for (const u of rows) {
+      const name = u.full_name || u.name || u.email || u.id;
       map[u.id] = { email: u.email ?? '', name };
     }
   } catch {
@@ -93,15 +95,21 @@ export async function getUsage(fromISO, toISO) {
   const to = toISO ? new Date(toISO) : new Date();
   const from = fromISO ? new Date(fromISO) : new Date(to.getTime() - 30 * 24 * 60 * 60 * 1000);
 
-  const { data, error } = await supabaseServer
-    .from('ai_token_usage')
-    .select('user_id, model_id, question, input_tokens, output_tokens, total_tokens, estimated_cost, created_at')
-    .gte('created_at', from.toISOString())
-    .lte('created_at', to.toISOString())
-    .order('created_at', { ascending: false })
-    .limit(10000);
+  let rows = [];
+  try {
+    const result = await pool.query(
+      `SELECT user_id, model_id, question, input_tokens, output_tokens, total_tokens, estimated_cost, created_at
+       FROM ai_token_usage
+       WHERE created_at >= $1 AND created_at <= $2
+       ORDER BY created_at DESC
+       LIMIT 10000`,
+      [from.toISOString(), to.toISOString()],
+    );
+    rows = result.rows;
+  } catch {
+    rows = [];
+  }
 
-  const rows = error ? [] : data ?? [];
   const byUserMap = new Map();
   const byModelMap = new Map();
   let totalTokens = 0;
@@ -129,11 +137,10 @@ export async function getUsage(fromISO, toISO) {
 
   let accessIds = [];
   try {
-    const accessRes = await supabaseServer
-      .from('user_app_permissions')
-      .select('user_id')
-      .eq('permission_code', 'ai_assistant');
-    accessIds = (accessRes.data ?? []).map((r) => r.user_id);
+    const accessRes = await pool.query(
+      "SELECT user_id FROM user_app_permissions WHERE permission_code = 'ai_assistant'",
+    );
+    accessIds = accessRes.rows.map((r) => r.user_id);
   } catch {
     /* access list optional */
   }

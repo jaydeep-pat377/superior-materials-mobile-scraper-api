@@ -155,6 +155,9 @@ app.get('/.well-known/assetlinks.json', (req, res) => {
 // Serve public PDF documents (NRMCA CIP guides) for mobile clients
 app.use('/pdfs', express.static(path.join(__dirname, 'public', 'pdfs')));
 
+// Serve local uploads (avatars, scraped-orders, chat-files) in development when S3 is not configured
+app.use('/uploads', express.static(path.join(__dirname, 'public', 'uploads')));
+
 // Explicit PDF endpoint as fallback (in case express.static fails on deployed server)
 app.get('/api/pdfs/:filename', (req, res) => {
   const allowedFiles = [
@@ -202,8 +205,14 @@ app.use('/api/ai', require('./src/routes/aiAssistantRoutes'));
 app.use('/api/chat', require('./src/routes/chatRoutes'));
 app.use('/api/qr', require('./src/routes/qrRoutes'));
 
+// Daily Intelligence
+app.use('/api/daily-intelligence', require('./src/routes/dailyIntelligenceRoutes'));
+
 // Mobile Federated Authentication Routes
 app.use('/api/auth/mobile', require('./src/routes/mobileAuthRoutes'));
+
+// Federated auth alias (used by some clients)
+app.post('/api/federated-auth/login', require('./src/controllers/mobileAuthController').login);
 app.use('/api/tenant', require('./src/routes/tenantRoutes'));
 app.use('/api/scan-history', require('./src/routes/scanHistoryRoutes'));
 
@@ -255,7 +264,10 @@ app.get('/', (req, res) => {
           send: 'POST /api/notifications/send',
           fcm: 'POST /api/notifications/fcm',
           sendOrder: 'POST /api/notifications/send-order',
-          history: 'GET /api/notifications/history?user_id={user_id}&tenant_id={tenant_id}&page={page}&limit={limit}'
+          history: 'GET /api/notifications/history?user_id={user_id}&tenant_id={tenant_id}&page={page}&limit={limit}',
+          recent: 'GET /api/notifications/recent',
+          markAsRead: 'PUT /api/notifications/read/{queueUuid}',
+          markAllAsRead: 'PUT /api/notifications/read-all'
         },
         tickets: {
           list: 'GET /api/tickets',
@@ -303,7 +315,14 @@ app.get('/', (req, res) => {
         chat: {
           readStatus: 'GET /api/chat/read-status',
           unreadCounts: 'GET /api/chat/unread-counts',
-          markRead: 'POST /api/chat/mark-read'
+          markRead: 'POST /api/chat/mark-read',
+          rooms: 'GET /api/chat/rooms',
+          getOrCreateRoom: 'GET /api/chat/rooms/{order_id}',
+          messages: 'GET /api/chat/messages/{order_id}',
+          sendMessage: 'POST /api/chat/messages',
+          deleteMessage: 'DELETE /api/chat/messages/{id}',
+          upload: 'POST /api/chat/upload',
+          userName: 'GET /api/chat/user/{user_id}'
         },
         emailTemplates: {
           list: 'GET /api/email-templates',
@@ -316,6 +335,10 @@ app.get('/', (req, res) => {
           chat: 'POST /api/ai/chat',
           history: 'GET /api/ai/history/{sessionId}',
           clearHistory: 'DELETE /api/ai/history/{sessionId}'
+        },
+        dailyIntelligence: {
+          get: 'GET /api/daily-intelligence',
+          odp: 'GET /api/daily-intelligence/odp'
         },
         shortUrls: {
           resolve: 'GET /api/short-urls/resolve/{code}'

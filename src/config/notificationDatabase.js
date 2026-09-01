@@ -1,24 +1,30 @@
-const { createClient } = require('@supabase/supabase-js');
+const pg = require('pg');
+const { Pool } = pg;
 
-// Separate Supabase instance for notifications
-const notificationSupabaseUrl = process.env.NOTIFICATION_SUPABASE_URL;
-const notificationSupabaseAnonKey = process.env.NOTIFICATION_SUPABASE_ANON_KEY;
+const NOTIFICATION_DATABASE_URL = process.env.NOTIFICATION_DATABASE_URL;
 
-let notificationSupabase = null;
+let notificationPool = null;
 
-if (notificationSupabaseUrl && notificationSupabaseAnonKey) {
-  notificationSupabase = createClient(notificationSupabaseUrl, notificationSupabaseAnonKey);
+if (NOTIFICATION_DATABASE_URL) {
+  notificationPool = new Pool({
+    connectionString: NOTIFICATION_DATABASE_URL,
+    max: 10,
+    idleTimeoutMillis: 60000,
+    connectionTimeoutMillis: 15000,
+    ssl: NOTIFICATION_DATABASE_URL.includes('localhost') ? false : { rejectUnauthorized: false }
+  });
+  notificationPool.on('error', (err) => {
+    console.error('Notification PostgreSQL pool error:', err.message || err);
+  });
 } else {
-  console.warn('Notification Supabase credentials not configured. Set NOTIFICATION_SUPABASE_URL and NOTIFICATION_SUPABASE_ANON_KEY in .env');
+  console.warn('NOTIFICATION_DATABASE_URL not configured - notification features will be unavailable');
 }
 
-function getNotificationSupabase() {
-  if (!notificationSupabase) {
-    throw new Error('Notification Supabase is not configured. Please set NOTIFICATION_SUPABASE_URL and NOTIFICATION_SUPABASE_ANON_KEY in your .env file.');
+function getNotificationPool() {
+  if (!notificationPool) {
+    throw new Error('Notification database not configured. Please set NOTIFICATION_DATABASE_URL in your .env file.');
   }
-  return notificationSupabase;
+  return notificationPool;
 }
 
-module.exports = {
-  getNotificationSupabase
-};
+module.exports = { getNotificationPool };

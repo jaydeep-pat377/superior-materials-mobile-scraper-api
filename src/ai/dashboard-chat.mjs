@@ -4,7 +4,7 @@
  *
  * Runs the agentic dashboard-generation loop with the Vercel AI SDK and pipes
  * the UI-message SSE stream to an Express response. Identity comes from the
- * backend's JWT auth middleware (req.user.id) rather than a Supabase cookie.
+ * backend's JWT auth middleware (req.user.id) rather than a session cookie.
  */
 
 import {
@@ -21,7 +21,7 @@ import { getModelDef } from './models.mjs';
 import { tools } from './tools.mjs';
 import { getSystemPrompt } from './system-prompt.mjs';
 import { runWithAuditContext } from './audit-log.mjs';
-import { supabaseServer } from './_supabase.mjs';
+import pool from './_db.mjs';
 
 function firstUserMessageText(messages) {
   for (const m of messages || []) {
@@ -92,12 +92,15 @@ export async function handleDashboardChat(body, res) {
   // Ensure a thread exists up front so audit-log + persistence can attribute.
   let threadId = incomingThreadId ?? null;
   if (!threadId && userId) {
-    const { data: created, error } = await supabaseServer
-      .from('ai_chat_threads')
-      .insert({ user_id: userId, messages: [] })
-      .select('id')
-      .single();
-    if (!error && created?.id) threadId = created.id;
+    try {
+      const { rows } = await pool.query(
+        "INSERT INTO ai_chat_threads (user_id, messages) VALUES ($1, '[]'::jsonb) RETURNING id",
+        [userId],
+      );
+      if (rows[0]?.id) threadId = rows[0].id;
+    } catch {
+      // non-critical — continue without a thread id
+    }
   }
 
   const modelMessages = await convertToModelMessages(messages, { tools });
@@ -151,21 +154,13 @@ export async function handleDashboardChat(body, res) {
         const estimatedCost =
           (inputTokens * (def.inputPricePer1M || 0)) / 1_000_000 +
           (outputTokens * (def.outputPricePer1M || 0)) / 1_000_000;
-        void supabaseServer
-          .from('ai_token_usage')
-          .insert({
-            user_id: userId,
-            thread_id: threadId,
-            model_id: def.id ?? modelId,
-            question,
-            input_tokens: inputTokens,
-            output_tokens: outputTokens,
-            total_tokens: totalTokens,
-            estimated_cost: estimatedCost,
-          })
-          .then(({ error }) => {
-            if (error) console.warn('[ai_token_usage] insert failed:', error.message);
-          });
+        void pool.query(
+          `INSERT INTO ai_token_usage (user_id, thread_id, model_id, question, input_tokens, output_tokens, total_tokens, estimated_cost)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+          [userId, threadId, def.id ?? modelId, question, inputTokens, outputTokens, totalTokens, estimatedCost],
+        ).catch((err) => {
+          console.warn('[ai_token_usage] insert failed:', err.message);
+        });
       } catch (err) {
         console.warn('[ai_token_usage] usage capture failed:', err?.message || err);
       }
@@ -173,17 +168,17 @@ export async function handleDashboardChat(body, res) {
       // Auto-generate a title on the first exchange.
       if (!threadId || !userId || !question) return;
       try {
-        const { data: existing } = await supabaseServer
-          .from('ai_chat_threads')
-          .select('title')
-          .eq('id', threadId)
-          .single();
+        const { rows: existingRows } = await pool.query(
+          'SELECT title FROM ai_chat_threads WHERE id = $1 LIMIT 1',
+          [threadId],
+        );
+        const existing = existingRows[0] || null;
         if (!existing || existing.title) return;
         const title = await generateThreadTitle(question, getModel(undefined, modelKeys));
-        await supabaseServer
-          .from('ai_chat_threads')
-          .update({ title, updated_at: new Date().toISOString() })
-          .eq('id', threadId);
+        await pool.query(
+          'UPDATE ai_chat_threads SET title = $1, updated_at = $2 WHERE id = $3',
+          [title, new Date().toISOString(), threadId],
+        );
       } catch (err) {
         console.warn('[ai] title generation failed:', err?.message || err);
       }

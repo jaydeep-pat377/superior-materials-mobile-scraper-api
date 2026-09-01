@@ -1,6 +1,6 @@
 const express = require('express');
 const router = express.Router();
-const { getSupabaseAdmin } = require('../config/database');
+const { getPool } = require('../config/database');
 
 /**
  * Get the current timezone abbreviation (handles DST automatically).
@@ -86,20 +86,13 @@ function getCurrentDateTime(ianaCode, now) {
  */
 router.get('/', async (req, res) => {
   try {
-    const supabase = getSupabaseAdmin();
-    const { data, error } = await supabase
-      .from('timezones')
-      .select('id, iana_code, display_name, abbreviation, utc_offset, dst_offset')
-      .eq('is_active', true)
-      .order('sort_order', { ascending: true });
-
-    if (error) {
-      console.error('[Timezones] DB error:', error.message);
-      return res.status(500).json({
-        success: false,
-        message: 'Failed to fetch timezones',
-      });
-    }
+    const pool = getPool();
+    const { rows: data } = await pool.query(
+      `SELECT id, iana_code, display_name, abbreviation, utc_offset, dst_offset
+       FROM timezones
+       WHERE is_active = true
+       ORDER BY sort_order ASC`
+    );
 
     // Add current abbreviation, current UTC offset, and current time (DST-aware)
     const now = new Date();

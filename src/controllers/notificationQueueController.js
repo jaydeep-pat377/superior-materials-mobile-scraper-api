@@ -27,7 +27,7 @@ function formatToUserTz(dateTimeStr, tz) {
  *       Fetches notifications from the notification queue for the authenticated user,
  *       filtered by tenant_id, ordered by created_at descending, with a default limit of 50.
  *
- *       Uses a **separate Supabase instance** dedicated to notifications.
+ *       Uses a **separate PostgreSQL database** dedicated to notifications.
  *     tags: [Notifications]
  *     security:
  *       - BearerAuth: []
@@ -266,18 +266,18 @@ async function getNotifications(req, res) {
       });
     }
 
-    if (!tenant_id) {
-      return res.status(400).json({
-        success: false,
-        message: 'tenant_id query parameter is required',
-        error_code: 'VALIDATION_ERROR'
-      });
+    // Notifications may be stored under either the central auth UUID or the
+    // tenant-local UUID (effectiveUserId). Pass both so the query finds all.
+    const userIds = [user_id];
+    if (req.user?.effectiveUserId && req.user.effectiveUserId !== user_id) {
+      userIds.push(req.user.effectiveUserId);
     }
 
     const parsedPage = page ? parseInt(page, 10) : 1;
     const parsedLimit = limit ? parseInt(limit, 10) : 50;
     const tz = req.user?.timezone || null;
-    const data = await notificationQueueService.getNotifications(user_id, parseInt(tenant_id, 10), parsedPage, parsedLimit);
+    const parsedTenantId = tenant_id ? parseInt(tenant_id, 10) : null;
+    const data = await notificationQueueService.getNotifications(userIds, parsedTenantId, parsedPage, parsedLimit);
 
     // Format timestamps in user's timezone
     if (tz && data.notifications) {
@@ -302,6 +302,51 @@ async function getNotifications(req, res) {
   }
 }
 
+async function markAsRead(req, res) {
+  try {
+    const { queueUuid } = req.params;
+    const userId = req.user?.effectiveUserId || req.query.user_id || req.user?.id;
+
+    if (!userId) {
+      return res.status(400).json({ success: false, message: 'user_id is required', error_code: 'VALIDATION_ERROR' });
+    }
+
+    let notification;
+    try {
+      notification = await notificationQueueService.markAsRead(queueUuid, userId);
+    } catch (e) {
+      // If effectiveUserId didn't match, try central auth UUID
+      if (e.message === 'Notification not found' && req.user?.id && req.user.id !== userId) {
+        notification = await notificationQueueService.markAsRead(queueUuid, req.user.id);
+      } else {
+        throw e;
+      }
+    }
+    return res.status(200).json({ success: true, message: 'Notification marked as read', data: notification });
+  } catch (error) {
+    const status = error.message === 'Notification not found' ? 404 : 500;
+    return res.status(status).json({ success: false, message: error.message, error_code: status === 404 ? 'NOT_FOUND' : 'INTERNAL_ERROR' });
+  }
+}
+
+async function markAllAsRead(req, res) {
+  try {
+    const userId = req.user?.effectiveUserId || req.body?.user_id || req.query.user_id || req.user?.id;
+    const tenantId = req.body?.tenant_id || req.query.tenant_id;
+
+    if (!userId || !tenantId) {
+      return res.status(400).json({ success: false, message: 'user_id and tenant_id are required', error_code: 'VALIDATION_ERROR' });
+    }
+
+    const result = await notificationQueueService.markAllAsRead(userId, parseInt(tenantId, 10));
+    return res.status(200).json({ success: true, message: 'All notifications marked as read', data: result });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message, error_code: 'INTERNAL_ERROR' });
+  }
+}
+
 module.exports = {
-  getNotifications
+  getNotifications,
+  markAsRead,
+  markAllAsRead
 };

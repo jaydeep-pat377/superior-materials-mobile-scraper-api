@@ -1,13 +1,13 @@
 /**
  * OTP Service
  *
- * Handles OTP generation, storage (in Supabase), email sending (SMTP/nodemailer),
+ * Handles OTP generation, storage (in PostgreSQL), email sending (SMTP/nodemailer),
  * and phone sending (Twilio). Includes expiry, retry limits, and cooldown logic.
  */
 
 const crypto = require('crypto');
 const nodemailer = require('nodemailer');
-const { getSupabaseAdmin } = require('../config/database');
+const { getPool } = require('../config/database');
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -80,7 +80,7 @@ function hashOtp(otp) {
 }
 
 // ---------------------------------------------------------------------------
-// Supabase OTP table helpers
+// OTP table helpers
 // Table: signup_otps (auto-created via migration or manually)
 //   id (uuid, pk), identifier (text), type (text: 'email'|'phone'),
 //   otp_hash (text), expires_at (timestamptz), attempts (int default 0),
@@ -94,18 +94,17 @@ function hashOtp(otp) {
  * @returns {{ allowed: boolean, waitSeconds?: number, error?: string }}
  */
 async function checkSendLimits(identifier, type) {
-  const supabase = getSupabaseAdmin();
+  const pool = getPool();
 
   // Get most recent OTP for this identifier+type
-  const { data: recent } = await supabase
-    .from('signup_otps')
-    .select('created_at')
-    .eq('identifier', identifier)
-    .eq('type', type)
-    .order('created_at', { ascending: false })
-    .limit(1);
+  const { rows: recent } = await pool.query(
+    `SELECT created_at FROM signup_otps
+     WHERE identifier = $1 AND type = $2
+     ORDER BY created_at DESC LIMIT 1`,
+    [identifier, type]
+  );
 
-  if (recent && recent.length > 0) {
+  if (recent.length > 0) {
     const lastSentAt = new Date(recent[0].created_at);
     const secondsSince = (Date.now() - lastSentAt.getTime()) / 1000;
     if (secondsSince < OTP_RESEND_COOLDOWN_SECONDS) {
@@ -116,14 +115,13 @@ async function checkSendLimits(identifier, type) {
 
   // Check hourly send limit
   const oneHourAgo = new Date(Date.now() - 60 * 60 * 1000).toISOString();
-  const { count } = await supabase
-    .from('signup_otps')
-    .select('id', { count: 'exact', head: true })
-    .eq('identifier', identifier)
-    .eq('type', type)
-    .gte('created_at', oneHourAgo);
+  const { rows: countRows } = await pool.query(
+    `SELECT COUNT(*)::int AS count FROM signup_otps
+     WHERE identifier = $1 AND type = $2 AND created_at >= $3`,
+    [identifier, type, oneHourAgo]
+  );
 
-  if (count >= OTP_MAX_SENDS) {
+  if (countRows[0].count >= OTP_MAX_SENDS) {
     return { allowed: false, error: 'Too many OTP requests. Please try again after an hour.' };
   }
 
@@ -137,31 +135,24 @@ async function checkSendLimits(identifier, type) {
  * @param {string} otp - Plain-text OTP (hashed before storage)
  */
 async function storeOtp(identifier, type, otp) {
-  const supabase = getSupabaseAdmin();
+  const pool = getPool();
 
   // Invalidate previous unverified OTPs for this identifier+type
-  await supabase
-    .from('signup_otps')
-    .delete()
-    .eq('identifier', identifier)
-    .eq('type', type)
-    .eq('verified', false);
+  await pool.query(
+    'DELETE FROM signup_otps WHERE identifier = $1 AND type = $2 AND verified = false',
+    [identifier, type]
+  );
 
   const expiresAt = new Date(Date.now() + OTP_EXPIRY_MINUTES * 60 * 1000).toISOString();
 
-  const { error } = await supabase
-    .from('signup_otps')
-    .insert({
-      identifier,
-      type,
-      otp_hash: hashOtp(otp),
-      expires_at: expiresAt,
-      attempts: 0,
-      verified: false
-    });
-
-  if (error) {
-    console.error('Error storing OTP:', error.message);
+  try {
+    await pool.query(
+      `INSERT INTO signup_otps (identifier, type, otp_hash, expires_at, attempts, verified)
+       VALUES ($1, $2, $3, $4, 0, false)`,
+      [identifier, type, hashOtp(otp), expiresAt]
+    );
+  } catch (err) {
+    console.error('Error storing OTP:', err.message);
     throw new Error('Failed to store OTP');
   }
 }
@@ -174,19 +165,17 @@ async function storeOtp(identifier, type, otp) {
  * @returns {{ success: boolean, error?: string, code?: string }}
  */
 async function verifyOtp(identifier, type, otp) {
-  const supabase = getSupabaseAdmin();
+  const pool = getPool();
 
   // Fetch the latest unverified OTP for this identifier+type
-  const { data: records } = await supabase
-    .from('signup_otps')
-    .select('*')
-    .eq('identifier', identifier)
-    .eq('type', type)
-    .eq('verified', false)
-    .order('created_at', { ascending: false })
-    .limit(1);
+  const { rows: records } = await pool.query(
+    `SELECT * FROM signup_otps
+     WHERE identifier = $1 AND type = $2 AND verified = false
+     ORDER BY created_at DESC LIMIT 1`,
+    [identifier, type]
+  );
 
-  if (!records || records.length === 0) {
+  if (records.length === 0) {
     return { success: false, error: 'No OTP found. Please request a new one.', code: 'OTP_NOT_FOUND' };
   }
 
@@ -194,23 +183,23 @@ async function verifyOtp(identifier, type, otp) {
 
   // Check expiry
   if (new Date(record.expires_at) < new Date()) {
-    await supabase.from('signup_otps').delete().eq('id', record.id);
+    await pool.query('DELETE FROM signup_otps WHERE id = $1', [record.id]);
     return { success: false, error: 'OTP has expired. Please request a new one.', code: 'OTP_EXPIRED' };
   }
 
   // Check max attempts
   if (record.attempts >= OTP_MAX_ATTEMPTS) {
-    await supabase.from('signup_otps').delete().eq('id', record.id);
+    await pool.query('DELETE FROM signup_otps WHERE id = $1', [record.id]);
     return { success: false, error: 'Too many failed attempts. Please request a new OTP.', code: 'MAX_ATTEMPTS' };
   }
 
   // Compare hashes
   if (record.otp_hash !== hashOtp(otp)) {
     // Increment attempts
-    await supabase
-      .from('signup_otps')
-      .update({ attempts: record.attempts + 1 })
-      .eq('id', record.id);
+    await pool.query(
+      'UPDATE signup_otps SET attempts = $1 WHERE id = $2',
+      [record.attempts + 1, record.id]
+    );
 
     const remaining = OTP_MAX_ATTEMPTS - record.attempts - 1;
     return {
@@ -221,10 +210,10 @@ async function verifyOtp(identifier, type, otp) {
   }
 
   // Mark as verified
-  await supabase
-    .from('signup_otps')
-    .update({ verified: true })
-    .eq('id', record.id);
+  await pool.query(
+    'UPDATE signup_otps SET verified = true WHERE id = $1',
+    [record.id]
+  );
 
   return { success: true };
 }
@@ -236,16 +225,15 @@ async function verifyOtp(identifier, type, otp) {
  * @returns {boolean}
  */
 async function isVerified(identifier, type) {
-  const supabase = getSupabaseAdmin();
-  const { data } = await supabase
-    .from('signup_otps')
-    .select('id')
-    .eq('identifier', identifier)
-    .eq('type', type)
-    .eq('verified', true)
-    .limit(1);
+  const pool = getPool();
+  const { rows } = await pool.query(
+    `SELECT id FROM signup_otps
+     WHERE identifier = $1 AND type = $2 AND verified = true
+     LIMIT 1`,
+    [identifier, type]
+  );
 
-  return data && data.length > 0;
+  return rows.length > 0;
 }
 
 // ---------------------------------------------------------------------------

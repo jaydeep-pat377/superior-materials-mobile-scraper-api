@@ -9,14 +9,14 @@ const { authenticate } = require('../middleware/auth');
 
 /**
  * @route   POST /api/notifications/send
- * @desc    Send push notification to device(s) (uses main Supabase)
+ * @desc    Send push notification to device(s) (uses main database)
  * @access  Private
  */
 router.post('/send', authenticate, notificationController.sendNotification);
 
 /**
  * @route   POST /api/notifications/fcm
- * @desc    Send push notification via FCM (uses notification Supabase)
+ * @desc    Send push notification via FCM (uses notification database)
  * @access  Private
  */
 router.post('/fcm', authenticate, notificationPushController.sendNotification);
@@ -30,10 +30,24 @@ router.post('/send-order', authenticate, orderNotificationController.sendOrderNo
 
 /**
  * @route   GET /api/notifications/history
- * @desc    Get notification history for authenticated user (uses notification Supabase)
+ * @desc    Get notification history for authenticated user (uses notification database)
  * @access  Private
  */
 router.get('/history', authenticate, notificationQueueController.getNotifications);
+
+/**
+ * @route   PUT /api/notifications/read/:queueUuid
+ * @desc    Mark a single notification as read
+ * @access  Private
+ */
+router.put('/read/:queueUuid', authenticate, notificationQueueController.markAsRead);
+
+/**
+ * @route   PUT /api/notifications/read-all
+ * @desc    Mark all notifications as read for authenticated user
+ * @access  Private
+ */
+router.put('/read-all', authenticate, notificationQueueController.markAllAsRead);
 
 /**
  * @route   GET /api/notifications/recent

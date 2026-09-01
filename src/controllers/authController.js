@@ -459,7 +459,7 @@ async function me(req, res) {
  *       1. Validates email format
  *       2. Checks rate limiting (5 min window)
  *       3. Verifies user exists in database
- *       4. Generates reset token via Supabase
+ *       4. Generates reset token
  *       5. Sends password reset email
  *
  *       **Security Notes:**
@@ -1036,7 +1036,7 @@ async function sendPhoneOtp(req, res) {
  *     summary: Verify phone OTP and complete registration (Step 4)
  *     description: |
  *       Verifies the phone OTP and completes user registration.
- *       Creates the user in Supabase Auth and public.users table.
+ *       Creates the user in the auth system and public.users table.
  *       Returns JWT access and refresh tokens on success.
  *     tags: [Auth]
  *     requestBody:
@@ -1206,15 +1206,14 @@ async function resendEmailOtp(req, res) {
       return res.status(400).json({ success: false, message: 'Email is required' });
     }
 
-    const { getSupabaseAdmin } = require('../config/database');
-    const supabase = getSupabaseAdmin();
+    const { getPool } = require('../config/database');
+    const pool = getPool();
 
     // Ensure there is a pending signup
-    const { data: pending } = await supabase
-      .from('signup_pending')
-      .select('email')
-      .eq('email', email.toLowerCase().trim())
-      .limit(1);
+    const { rows: pending } = await pool.query(
+      'SELECT email FROM signup_pending WHERE email = $1 LIMIT 1',
+      [email.toLowerCase().trim()]
+    );
 
     if (!pending || pending.length === 0) {
       return res.status(404).json({ success: false, message: 'No pending signup found. Please sign up first.' });
@@ -1269,15 +1268,14 @@ async function resendPhoneOtp(req, res) {
       return res.status(400).json({ success: false, message: 'Email is required' });
     }
 
-    const { getSupabaseAdmin } = require('../config/database');
-    const supabase = getSupabaseAdmin();
+    const { getPool } = require('../config/database');
+    const pool = getPool();
     const normalizedEmail = email.toLowerCase().trim();
 
-    const { data: pending } = await supabase
-      .from('signup_pending')
-      .select('*')
-      .eq('email', normalizedEmail)
-      .limit(1);
+    const { rows: pending } = await pool.query(
+      'SELECT * FROM signup_pending WHERE email = $1 LIMIT 1',
+      [normalizedEmail]
+    );
 
     if (!pending || pending.length === 0) {
       return res.status(404).json({ success: false, message: 'No pending signup found.' });

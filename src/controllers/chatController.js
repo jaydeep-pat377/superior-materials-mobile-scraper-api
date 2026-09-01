@@ -30,7 +30,7 @@ async function getReadStatus(req, res) {
   try {
     const userId = req.user.id;
     const tz = req.user?.timezone || null;
-    const data = await chatService.getReadStatus(userId);
+    const data = await chatService.getReadStatus(userId, req.user?.email);
 
     const formatted = (data || []).map(row => ({
       ...row,
@@ -64,7 +64,7 @@ async function getUnreadCounts(req, res) {
       ? orderIdsParam.split(',').map(id => parseInt(id.trim(), 10)).filter(id => !isNaN(id))
       : null;
 
-    const data = await chatService.getUnreadCounts(userId, orderIds);
+    const data = await chatService.getUnreadCounts(userId, orderIds, req.user?.email);
 
     return res.status(200).json({
       success: true,
@@ -99,7 +99,7 @@ async function markAsRead(req, res) {
     }
 
     const tz = req.user?.timezone || null;
-    const data = await chatService.markAsRead(userId, order_id);
+    const data = await chatService.markAsRead(userId, order_id, req.user?.email);
 
     return res.status(200).json({
       success: true,
@@ -120,14 +120,6 @@ async function markAsRead(req, res) {
  * POST /api/chat/notify
  * Internal endpoint called by tenant frontends after a chat message is inserted.
  * Authenticated via x-internal-token (see middleware/internalAuth).
- * Body:
- *   {
- *     order_id, order_code, chat_id,
- *     sender_id, sender_name,
- *     message_preview,
- *     tenant_subdomain,
- *     recipient_user_ids: string[]
- *   }
  */
 async function notifyChatMessage(req, res) {
   try {

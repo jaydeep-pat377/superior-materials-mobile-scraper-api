@@ -1,11 +1,11 @@
-const { getSupabaseAdmin } = require('../config/database');
-const { getAuthSupabaseAdmin } = require('../config/authDatabase');
+const { getPool } = require('../config/database');
+const { getAuthPool } = require('../config/authDatabase');
 const { requestEmailOtp, requestPhoneOtp, verifyOtp, isVerified } = require('./otpService');
 const { hashPassword } = require('../utils/encryptionUtils');
+const crypto = require('crypto');
 
 /**
- * Normalize phone number for comparison — strips +, spaces, dashes
- * Supabase Auth stores phones inconsistently (sometimes with +, sometimes without)
+ * Normalize phone number for comparison -- strips +, spaces, dashes
  */
 function normalizePhone(phone) {
   if (!phone) return '';
@@ -21,12 +21,11 @@ function phonesMatch(a, b) {
  * Step 1: Initial signup - collect basic info and send email OTP
  *
  * Creates a pending signup record in signup_pending table and sends
- * an email OTP. The user is NOT created in Supabase Auth until both
- * email and phone are verified.
+ * an email OTP. The user is NOT created until both email and phone
+ * are verified.
  *
- * Password is NOT required at signup. A random password is generated
- * when the account is finalized in Step 4. Users can set their own
- * password via "forgot password" after admin approval.
+ * Password is NOT required at signup. Users set their own
+ * password in Step 5.
  *
  * @param {Object} params
  * @param {string} params.email
@@ -34,91 +33,86 @@ function phonesMatch(a, b) {
  * @returns {Object} { success, message, error, code }
  */
 async function signup({ email, full_name }) {
-  const supabase = getSupabaseAdmin();
+  const pool = getPool();
+  const authPool = getAuthPool();
   const normalizedEmail = email.toLowerCase().trim();
 
   console.log('[Signup] Checking email:', normalizedEmail);
 
   // Check if email already exists as a fully registered user in public.users
-  const { data: existingUser, error: userQueryError } = await supabase
-    .from('users')
-    .select('id, active')
-    .eq('email', normalizedEmail)
-    .limit(1);
+  const { rows: existingUser } = await pool.query(
+    'SELECT id, active FROM users WHERE email = $1 LIMIT 1',
+    [normalizedEmail]
+  );
 
-  console.log('[Signup] public.users query result:', { found: existingUser?.length || 0, error: userQueryError?.message || null });
+  console.log('[Signup] public.users query result:', { found: existingUser?.length || 0 });
 
   if (existingUser && existingUser.length > 0) {
     if (existingUser[0].active) {
       return { success: false, error: 'A user with this email already exists', code: 'EMAIL_EXISTS' };
     }
-    // Inactive user — allow re-signup to update phone/password
+    // Inactive user -- allow re-signup to update phone/password
     console.log('[Signup] Inactive user found, allowing re-signup for:', normalizedEmail);
   }
 
-  // Check Supabase Auth for existing user with this email (skip if inactive user found — they'll be in auth already)
+  // Check auth_tenant.users for existing user with this email (skip if inactive user found -- they'll be in auth already)
   if (!existingUser || existingUser.length === 0) {
     try {
-      const { data: authList, error: authListError } = await supabase.auth.admin.listUsers({
-        page: 1,
-        perPage: 1000
-      });
+      const { rows: authMatch } = await authPool.query(
+        'SELECT id FROM auth_tenant.users WHERE email = $1 LIMIT 1',
+        [normalizedEmail]
+      );
 
-      if (!authListError && authList?.users) {
-        const authMatch = authList.users.find(
-          u => u.email?.toLowerCase() === normalizedEmail
-        );
-        console.log('[Signup] auth.users check: scanned', authList.users.length, 'users, match:', !!authMatch);
-        if (authMatch) {
-          return { success: false, error: 'A user with this email already exists', code: 'EMAIL_EXISTS' };
-        }
+      console.log('[Signup] auth_tenant.users check: match:', !!(authMatch && authMatch.length > 0));
+      if (authMatch && authMatch.length > 0) {
+        return { success: false, error: 'A user with this email already exists', code: 'EMAIL_EXISTS' };
       }
     } catch (authCheckErr) {
-      // Non-fatal: Step 5 createUser will catch auth duplicates
-      console.log('[Signup] auth.users check skipped:', authCheckErr.message);
+      // Non-fatal: Step 5 INSERT will catch duplicates
+      console.log('[Signup] auth_tenant.users check skipped:', authCheckErr.message);
     }
   }
 
   // Check if there's already a pending signup with verified steps
   // This applies to ALL users (new, inactive, or re-signup) so they can resume where they left off
-  const { data: existingPending } = await supabase
-    .from('signup_pending')
-    .select('email_verified, phone_verified')
-    .eq('email', normalizedEmail)
-    .limit(1);
+  const { rows: existingPending } = await pool.query(
+    'SELECT email_verified, phone_verified FROM signup_pending WHERE email = $1 LIMIT 1',
+    [normalizedEmail]
+  );
 
   if (existingPending && existingPending.length > 0 && existingPending[0].email_verified) {
     // Update name in case it changed (don't reset verification flags)
-    await supabase
-      .from('signup_pending')
-      .update({ full_name, updated_at: new Date().toISOString() })
-      .eq('email', normalizedEmail);
+    await pool.query(
+      'UPDATE signup_pending SET full_name = $1, updated_at = $2 WHERE email = $3',
+      [full_name, new Date().toISOString(), normalizedEmail]
+    );
 
     if (existingPending[0].phone_verified) {
-      // Both verified — redirect to set password
+      // Both verified -- redirect to set password
       return { success: false, error: 'Email and phone are already verified. Please set your password to complete signup.', code: 'VERIFICATION_COMPLETE' };
     }
-    // Email verified but phone not — redirect to phone verification
+    // Email verified but phone not -- redirect to phone verification
     return { success: false, error: 'Email is already verified. Please proceed to phone verification.', code: 'EMAIL_ALREADY_VERIFIED' };
   }
 
-  // No verified steps — upsert a fresh pending record
-  const { error: pendingError } = await supabase
-    .from('signup_pending')
-    .upsert({
-      email: normalizedEmail,
-      full_name,
-      password_hash: '',
-      phone_number: '',
-      phone_country_code: '',
-      title: '',
-      email_verified: false,
-      phone_verified: false,
-      updated_at: new Date().toISOString()
-    }, { onConflict: 'email' });
-
-  if (pendingError) {
-    console.error('[Signup] Error creating pending signup:', pendingError.message, pendingError.details, pendingError.hint);
+  // No verified steps -- upsert a fresh pending record
+  try {
+    await pool.query(
+      `INSERT INTO signup_pending (email, full_name, password_hash, phone_number, phone_country_code, title, email_verified, phone_verified, updated_at)
+       VALUES ($1, $2, '', '', '', '', false, false, $3)
+       ON CONFLICT (email) DO UPDATE SET
+         full_name = EXCLUDED.full_name,
+         password_hash = EXCLUDED.password_hash,
+         phone_number = EXCLUDED.phone_number,
+         phone_country_code = EXCLUDED.phone_country_code,
+         title = EXCLUDED.title,
+         email_verified = EXCLUDED.email_verified,
+         phone_verified = EXCLUDED.phone_verified,
+         updated_at = EXCLUDED.updated_at`,
+      [normalizedEmail, full_name, new Date().toISOString()]
+    );
+  } catch (pendingError) {
+    console.error('[Signup] Error creating pending signup:', pendingError.message);
     return { success: false, error: 'Failed to initiate signup. Please try again.', code: 'PENDING_CREATE_FAILED' };
   }
 
@@ -143,20 +137,19 @@ async function signup({ email, full_name }) {
  */
 async function verifyEmailOtp(email, otp) {
   const normalizedEmail = email.toLowerCase().trim();
-  const supabase = getSupabaseAdmin();
+  const pool = getPool();
 
   // Ensure there's a pending signup for this email
-  const { data: pending } = await supabase
-    .from('signup_pending')
-    .select('*')
-    .eq('email', normalizedEmail)
-    .limit(1);
+  const { rows: pending } = await pool.query(
+    'SELECT * FROM signup_pending WHERE email = $1 LIMIT 1',
+    [normalizedEmail]
+  );
 
   if (!pending || pending.length === 0) {
     return { success: false, error: 'No pending signup found for this email. Please sign up first.', code: 'NO_PENDING_SIGNUP' };
   }
 
-  // Reject if email is already verified — prevent re-verification
+  // Reject if email is already verified -- prevent re-verification
   if (pending[0].email_verified) {
     return { success: false, error: 'Email is already verified. Please proceed to phone verification.', code: 'ALREADY_VERIFIED' };
   }
@@ -167,10 +160,10 @@ async function verifyEmailOtp(email, otp) {
   }
 
   // Mark email as verified in pending record
-  await supabase
-    .from('signup_pending')
-    .update({ email_verified: true, updated_at: new Date().toISOString() })
-    .eq('email', normalizedEmail);
+  await pool.query(
+    'UPDATE signup_pending SET email_verified = true, updated_at = $1 WHERE email = $2',
+    [new Date().toISOString(), normalizedEmail]
+  );
 
   return {
     success: true,
@@ -188,14 +181,13 @@ async function verifyEmailOtp(email, otp) {
  */
 async function sendPhoneOtpForSignup(email, phone_country_code, phone_number) {
   const normalizedEmail = email.toLowerCase().trim();
-  const supabase = getSupabaseAdmin();
+  const pool = getPool();
 
   // Check pending signup exists and email is verified
-  const { data: pending } = await supabase
-    .from('signup_pending')
-    .select('*')
-    .eq('email', normalizedEmail)
-    .limit(1);
+  const { rows: pending } = await pool.query(
+    'SELECT * FROM signup_pending WHERE email = $1 LIMIT 1',
+    [normalizedEmail]
+  );
 
   if (!pending || pending.length === 0) {
     return { success: false, error: 'No pending signup found. Please sign up first.', code: 'NO_PENDING_SIGNUP' };
@@ -209,11 +201,10 @@ async function sendPhoneOtpForSignup(email, phone_country_code, phone_number) {
   const fullPhone = `${phone_country_code}${phone_number}`.replace(/\s+/g, '');
 
   // Check if phone number belongs to a different active user
-  const { data: phoneOwners } = await supabase
-    .from('users')
-    .select('email, active')
-    .eq('phone_number', phone_number)
-    .eq('phone_country_code', phone_country_code);
+  const { rows: phoneOwners } = await pool.query(
+    'SELECT email, active FROM users WHERE phone_number = $1 AND phone_country_code = $2',
+    [phone_number, phone_country_code]
+  );
 
   if (phoneOwners && phoneOwners.length > 0) {
     // Allow if the phone belongs to the same user (case-insensitive) or to an inactive user
@@ -226,14 +217,10 @@ async function sendPhoneOtpForSignup(email, phone_country_code, phone_number) {
   }
 
   // Update phone in pending record
-  await supabase
-    .from('signup_pending')
-    .update({
-      phone_number,
-      phone_country_code,
-      updated_at: new Date().toISOString()
-    })
-    .eq('email', normalizedEmail);
+  await pool.query(
+    'UPDATE signup_pending SET phone_number = $1, phone_country_code = $2, updated_at = $3 WHERE email = $4',
+    [phone_number, phone_country_code, new Date().toISOString(), normalizedEmail]
+  );
 
   const otpResult = await requestPhoneOtp(fullPhone);
   if (!otpResult.success) {
@@ -257,13 +244,12 @@ async function sendPhoneOtpForSignup(email, phone_country_code, phone_number) {
  */
 async function verifyPhoneOtp(email, otp) {
   const normalizedEmail = email.toLowerCase().trim();
-  const supabase = getSupabaseAdmin();
+  const pool = getPool();
 
-  const { data: pending } = await supabase
-    .from('signup_pending')
-    .select('*')
-    .eq('email', normalizedEmail)
-    .limit(1);
+  const { rows: pending } = await pool.query(
+    'SELECT * FROM signup_pending WHERE email = $1 LIMIT 1',
+    [normalizedEmail]
+  );
 
   if (!pending || pending.length === 0) {
     return { success: false, error: 'No pending signup found.', code: 'NO_PENDING_SIGNUP' };
@@ -285,11 +271,11 @@ async function verifyPhoneOtp(email, otp) {
     return result;
   }
 
-  // Mark phone as verified — do NOT create user yet (password step pending)
-  await supabase
-    .from('signup_pending')
-    .update({ phone_verified: true, updated_at: new Date().toISOString() })
-    .eq('email', normalizedEmail);
+  // Mark phone as verified -- do NOT create user yet (password step pending)
+  await pool.query(
+    'UPDATE signup_pending SET phone_verified = true, updated_at = $1 WHERE email = $2',
+    [new Date().toISOString(), normalizedEmail]
+  );
 
   return {
     success: true,
@@ -300,7 +286,7 @@ async function verifyPhoneOtp(email, otp) {
 /**
  * Step 5: Set password and complete registration
  *
- * Creates the real user in Supabase Auth + public.users with the user-chosen password.
+ * Creates the real user in auth_tenant.users + public.users with the user-chosen password.
  * Only allowed after both email and phone are verified.
  *
  * @param {string} email
@@ -309,14 +295,14 @@ async function verifyPhoneOtp(email, otp) {
  */
 async function setPasswordAndComplete(email, password) {
   const normalizedEmail = email.toLowerCase().trim();
-  const supabase = getSupabaseAdmin();
+  const pool = getPool();
+  const authPool = getAuthPool();
 
   // Load pending signup
-  const { data: pending } = await supabase
-    .from('signup_pending')
-    .select('*')
-    .eq('email', normalizedEmail)
-    .limit(1);
+  const { rows: pending } = await pool.query(
+    'SELECT * FROM signup_pending WHERE email = $1 LIMIT 1',
+    [normalizedEmail]
+  );
 
   if (!pending || pending.length === 0) {
     return { success: false, error: 'No pending signup found.', code: 'NO_PENDING_SIGNUP' };
@@ -333,15 +319,17 @@ async function setPasswordAndComplete(email, password) {
     return { success: false, error: 'Please verify your phone number first.', code: 'PHONE_NOT_VERIFIED' };
   }
 
-  // ── Email uniqueness validation across all user tables ──
+  // -- Email uniqueness validation across all user tables --
 
-  // 1. Check public.users (no limit — need full count for duplicate detection)
-  const { data: publicUsers, error: publicQueryErr } = await supabase
-    .from('users')
-    .select('id, active, phone_number, phone_country_code')
-    .eq('email', normalizedEmail);
-
-  if (publicQueryErr) {
+  // 1. Check public.users (no limit -- need full count for duplicate detection)
+  let publicUsers;
+  try {
+    const { rows } = await pool.query(
+      'SELECT id, active, phone_number, phone_country_code FROM users WHERE email = $1',
+      [normalizedEmail]
+    );
+    publicUsers = rows;
+  } catch (publicQueryErr) {
     console.error('[Signup] public.users query failed:', publicQueryErr.message);
     return { success: false, error: 'Unable to verify account. Please try again.', code: 'DB_QUERY_FAILED' };
   }
@@ -352,14 +340,14 @@ async function setPasswordAndComplete(email, password) {
   }
 
   // 2. Check auth_tenant.users
-  const authSupabase = getAuthSupabaseAdmin();
-  const { data: tenantUsers, error: tenantQueryErr } = await authSupabase
-    .schema('auth_tenant')
-    .from('users')
-    .select('id')
-    .eq('email', normalizedEmail);
-
-  if (tenantQueryErr) {
+  let tenantUsers;
+  try {
+    const { rows } = await authPool.query(
+      'SELECT id FROM auth_tenant.users WHERE email = $1',
+      [normalizedEmail]
+    );
+    tenantUsers = rows;
+  } catch (tenantQueryErr) {
     console.error('[Signup] auth_tenant.users query failed:', tenantQueryErr.message);
     return { success: false, error: 'Unable to verify account. Please try again.', code: 'DB_QUERY_FAILED' };
   }
@@ -369,24 +357,10 @@ async function setPasswordAndComplete(email, password) {
     return { success: false, error: 'This email is associated with multiple accounts. Please contact support.', code: 'DUPLICATE_EMAIL' };
   }
 
-  // 3. Check Supabase Auth (auth.users) — also save the match for reuse
-  let existingAuthUser = null;
-  try {
-    const { data: authList } = await supabase.auth.admin.listUsers({ page: 1, perPage: 1000 });
-    if (authList?.users) {
-      const authMatches = authList.users.filter(u => u.email?.toLowerCase() === normalizedEmail);
-      if (authMatches.length > 1) {
-        console.error('[Signup] Duplicate email in Supabase Auth:', normalizedEmail, 'count:', authMatches.length);
-        return { success: false, error: 'This email is associated with multiple accounts. Please contact support.', code: 'DUPLICATE_EMAIL' };
-      }
-      if (authMatches.length === 1) {
-        existingAuthUser = authMatches[0];
-        console.log('[Signup] Found existing auth user:', existingAuthUser.id, 'for:', normalizedEmail);
-      }
-    }
-  } catch (authCheckErr) {
-    // Non-fatal: createUser / updateUserById will catch auth-level duplicates
-    console.warn('[Signup] Supabase Auth duplicate check skipped:', authCheckErr.message);
+  // 3. Determine existing auth_tenant user
+  let existingAuthUser = tenantUsers && tenantUsers.length === 1 ? tenantUsers[0] : null;
+  if (existingAuthUser) {
+    console.log('[Signup] Found existing auth_tenant user:', existingAuthUser.id, 'for:', normalizedEmail);
   }
 
   // 4. Determine user state
@@ -398,8 +372,9 @@ async function setPasswordAndComplete(email, password) {
 
   const fullPhone = `${record.phone_country_code}${record.phone_number}`.replace(/\s+/g, '');
   const now = new Date().toISOString();
+  const bcryptHash = await hashPassword(password);
 
-  // --- UPDATE PATH: Inactive user exists — update phone + password ---
+  // --- UPDATE PATH: Inactive user exists -- update phone + password ---
   if (existingUser) {
     console.log('[Signup] Inactive user found, updating:', normalizedEmail);
 
@@ -407,68 +382,31 @@ async function setPasswordAndComplete(email, password) {
     const phoneChanged = existingUser.phone_number !== record.phone_number || existingUser.phone_country_code !== record.phone_country_code;
     if (phoneChanged) {
       console.log('[Signup] Updating phone number for:', normalizedEmail);
-      const { error: updateError } = await supabase
-        .from('users')
-        .update({
-          phone_number: record.phone_number,
-          phone_country_code: record.phone_country_code,
-          full_name: record.full_name,
-          updated_at: now
-        })
-        .eq('id', existingUser.id);
-
-      if (updateError) {
+      try {
+        await pool.query(
+          'UPDATE users SET phone_number = $1, phone_country_code = $2, full_name = $3, updated_at = $4 WHERE id = $5',
+          [record.phone_number, record.phone_country_code, record.full_name, now, existingUser.id]
+        );
+      } catch (updateError) {
         console.error('[Signup] Error updating user phone:', updateError.message);
         return { success: false, error: 'Failed to update user. Please try again.', code: 'UPDATE_FAILED' };
       }
     }
 
-    // Update password (and phone if changed) in Supabase Auth
-    const authUpdateData = {
-      password,
-      user_metadata: {
-        full_name: record.full_name,
-        phone_number: record.phone_number,
-        phone_country_code: record.phone_country_code
-      }
-    };
-    if (phoneChanged) {
-      authUpdateData.phone = fullPhone;
-      authUpdateData.phone_confirm = true;
-    }
-
-    const { error: authUpdateError } = await supabase.auth.admin.updateUserById(existingUser.id, authUpdateData);
-    if (authUpdateError) {
-      console.error('[Signup] Error updating Supabase Auth user:', authUpdateError.message);
-      return { success: false, error: 'Failed to update password. Please try again.', code: 'AUTH_UPDATE_FAILED' };
-    }
-
-    // Update auth_tenant.users
+    // Update auth_tenant.users password (and phone if changed)
     try {
-      const bcryptHash = await hashPassword(password);
-      const { error: atUpdateError } = await authSupabase
-        .schema('auth_tenant')
-        .from('users')
-        .update({
-          password_hash: bcryptHash,
-          phone_number: record.phone_number,
-          phone_country_code: record.phone_country_code,
-          full_name: record.full_name,
-          updated_at: now
-        })
-        .eq('email', normalizedEmail);
-
-      if (atUpdateError) {
-        console.error('[Signup] auth_tenant.users update error:', atUpdateError.message);
-      }
+      await authPool.query(
+        `UPDATE auth_tenant.users SET password_hash = $1, phone_number = $2, phone_country_code = $3, full_name = $4, updated_at = $5 WHERE email = $6`,
+        [bcryptHash, record.phone_number, record.phone_country_code, record.full_name, now, normalizedEmail]
+      );
     } catch (authTenantErr) {
-      console.error('[Signup] auth_tenant sync error:', authTenantErr.message);
+      console.error('[Signup] auth_tenant.users update error:', authTenantErr.message);
     }
 
     // Clean up pending record and OTPs
-    await supabase.from('signup_pending').delete().eq('email', normalizedEmail);
-    await supabase.from('signup_otps').delete().eq('identifier', normalizedEmail);
-    await supabase.from('signup_otps').delete().eq('identifier', fullPhone);
+    await pool.query('DELETE FROM signup_pending WHERE email = $1', [normalizedEmail]);
+    await pool.query('DELETE FROM signup_otps WHERE identifier = $1', [normalizedEmail]);
+    await pool.query('DELETE FROM signup_otps WHERE identifier = $1', [fullPhone]);
 
     return {
       success: true,
@@ -476,189 +414,118 @@ async function setPasswordAndComplete(email, password) {
     };
   }
 
-  // --- CREATE OR UPDATE PATH based on Supabase Auth state ---
-  let supabaseUser;
+  // --- CREATE OR UPDATE PATH based on auth_tenant state ---
+  let userId;
 
   if (existingAuthUser) {
-    // Auth user already exists (previous incomplete signup) — update instead of create
+    // Auth user already exists (previous incomplete signup) -- update instead of create
     console.log('[Signup] Auth user already exists, updating:', existingAuthUser.id);
 
-    // If phone is owned by a DIFFERENT auth user, clear it first
+    // Check if phone is owned by a DIFFERENT auth_tenant user
     try {
-      const { data: authList } = await supabase.auth.admin.listUsers({ page: 1, perPage: 1000 });
-      const phoneOwner = authList?.users?.find(u => phonesMatch(u.phone, fullPhone) && u.id !== existingAuthUser.id);
-      if (phoneOwner) {
-        const { data: ownerProfile } = await supabase
-          .from('users')
-          .select('id, active')
-          .eq('id', phoneOwner.id)
-          .limit(1);
+      const { rows: phoneOwnerRows } = await authPool.query(
+        `SELECT u.id FROM auth_tenant.users u
+         WHERE REPLACE(REPLACE(REPLACE(COALESCE(u.phone_country_code, '') || COALESCE(u.phone_number, ''), '+', ''), '-', ''), ' ', '') = $1
+         AND u.id != $2
+         AND u.deleted_at IS NULL
+         LIMIT 1`,
+        [normalizePhone(fullPhone), existingAuthUser.id]
+      );
+
+      if (phoneOwnerRows && phoneOwnerRows.length > 0) {
+        const phoneOwnerId = phoneOwnerRows[0].id;
+
+        // Check if that phone owner is active in public.users
+        const { rows: ownerProfile } = await pool.query(
+          'SELECT id, active FROM users WHERE id::text = $1 LIMIT 1',
+          [phoneOwnerId.toString()]
+        );
 
         if (ownerProfile && ownerProfile.length > 0 && ownerProfile[0].active) {
           return { success: false, error: 'Phone number is already in use by another account.', code: 'PHONE_EXISTS' };
         }
-        console.log('[Signup] Clearing phone from orphaned auth user:', phoneOwner.id);
-        await supabase.auth.admin.updateUserById(phoneOwner.id, { phone: '+10000000000' });
+
+        // Orphaned -- clear phone from the other user
+        console.log('[Signup] Clearing phone from orphaned auth user:', phoneOwnerId);
+        await authPool.query(
+          `UPDATE auth_tenant.users SET phone_number = NULL, phone_country_code = NULL, updated_at = $1 WHERE id = $2`,
+          [now, phoneOwnerId]
+        );
       }
     } catch (phoneCheckErr) {
       console.warn('[Signup] Phone conflict check skipped:', phoneCheckErr.message);
     }
 
-    const { error: authUpdateErr } = await supabase.auth.admin.updateUserById(existingAuthUser.id, {
-      password,
-      phone: fullPhone,
-      phone_confirm: true,
-      user_metadata: {
-        full_name: record.full_name,
-        phone_number: record.phone_number,
-        phone_country_code: record.phone_country_code
-      }
-    });
-
-    if (authUpdateErr) {
+    // Update existing auth_tenant user
+    try {
+      await authPool.query(
+        `UPDATE auth_tenant.users SET password_hash = $1, phone_number = $2, phone_country_code = $3, full_name = $4, updated_at = $5 WHERE id = $6`,
+        [bcryptHash, record.phone_number, record.phone_country_code, record.full_name, now, existingAuthUser.id]
+      );
+    } catch (authUpdateErr) {
       console.error('[Signup] Failed to update existing auth user:', authUpdateErr.message);
       return { success: false, error: 'Failed to set password. Please try again.', code: 'AUTH_UPDATE_FAILED' };
     }
 
-    supabaseUser = existingAuthUser;
+    userId = existingAuthUser.id;
   } else {
-    // No auth user exists — create new
-    let { data: authData, error: authError } = await supabase.auth.admin.createUser({
-      email: normalizedEmail,
-      password,
-      email_confirm: true,
-      phone: fullPhone,
-      phone_confirm: true,
-      user_metadata: {
-        full_name: record.full_name,
-        phone_number: record.phone_number,
-        phone_country_code: record.phone_country_code
+    // No auth user exists -- create new in auth_tenant.users
+    try {
+      const { rows: newAuthUser } = await authPool.query(
+        `INSERT INTO auth_tenant.users (email, password_hash, full_name, phone_number, phone_country_code, title, user_role, active, email_verified_at, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, 'user', false, $7, $7, $7)
+         RETURNING id`,
+        [normalizedEmail, bcryptHash, record.full_name, record.phone_number, record.phone_country_code, record.title, now]
+      );
+
+      if (!newAuthUser || newAuthUser.length === 0) {
+        return { success: false, error: 'Failed to create user', code: 'AUTH_CREATE_FAILED' };
       }
-    });
 
-    // If phone conflict — clear orphaned phone and retry
-    if (authError && authError.message?.includes('Phone number already registered')) {
-      console.log('[Signup] Phone conflict on createUser, checking owner for:', fullPhone);
-      try {
-        const { data: authList } = await supabase.auth.admin.listUsers({ page: 1, perPage: 1000 });
-        const allUsers = authList?.users || [];
-        const phoneOwner = allUsers.find(u => phonesMatch(u.phone, fullPhone));
-
-        if (phoneOwner) {
-          const { data: ownerProfile } = await supabase
-            .from('users')
-            .select('id, active')
-            .eq('id', phoneOwner.id)
-            .limit(1);
-
-          if (ownerProfile && ownerProfile.length > 0 && ownerProfile[0].active) {
-            return { success: false, error: 'Phone number is already in use by another account.', code: 'PHONE_EXISTS' };
-          }
-
-          // Orphaned — clear phone and retry
-          console.log('[Signup] Clearing phone from orphaned auth user:', phoneOwner.id);
-          await supabase.auth.admin.updateUserById(phoneOwner.id, { phone: '+10000000000' });
-
-          const retry = await supabase.auth.admin.createUser({
-            email: normalizedEmail,
-            password,
-            email_confirm: true,
-            phone: fullPhone,
-            phone_confirm: true,
-            user_metadata: {
-              full_name: record.full_name,
-              phone_number: record.phone_number,
-              phone_country_code: record.phone_country_code
-            }
-          });
-          authData = retry.data;
-          authError = retry.error;
-        }
-      } catch (phoneFixErr) {
-        console.error('[Signup] Phone conflict resolution failed:', phoneFixErr.message);
-      }
-    }
-
-    if (authError) {
+      userId = newAuthUser[0].id;
+    } catch (authError) {
       console.error('[Signup] createUser failed:', authError.message);
       return { success: false, error: authError.message || 'Failed to create user', code: 'AUTH_CREATE_FAILED' };
     }
-
-    supabaseUser = authData.user;
   }
 
   // Create or update user profile in public.users
-  const { error: profileError } = await supabase
-    .from('users')
-    .upsert({
-      id: supabaseUser.id,
-      email: normalizedEmail,
-      full_name: record.full_name,
-      phone_number: record.phone_number,
-      phone_country_code: record.phone_country_code,
-      title: record.title,
-      user_type: 'QR',
-      active: false,
-      created_at: now,
-      updated_at: now
-    }, { onConflict: 'id' });
-
-  if (profileError) {
+  // Generate a UUID for the public.users id
+  const publicUserId = crypto.randomUUID();
+  try {
+    await pool.query(
+      `INSERT INTO users (id, email, full_name, phone_number, phone_country_code, title, user_type, active, created_at, updated_at)
+       VALUES ($1, $2, $3, $4, $5, $6, 'QR', false, $7, $7)
+       ON CONFLICT (id) DO UPDATE SET
+         email = EXCLUDED.email,
+         full_name = EXCLUDED.full_name,
+         phone_number = EXCLUDED.phone_number,
+         phone_country_code = EXCLUDED.phone_country_code,
+         title = EXCLUDED.title,
+         user_type = EXCLUDED.user_type,
+         active = EXCLUDED.active,
+         updated_at = EXCLUDED.updated_at`,
+      [publicUserId, normalizedEmail, record.full_name, record.phone_number, record.phone_country_code, record.title, now]
+    );
+  } catch (profileError) {
     console.error('Profile creation error:', profileError.message);
   }
 
-  // Create or update user in auth_tenant database (used by mobile login)
+  // Link to all QR-enabled tenants
   try {
-    const bcryptHash = await hashPassword(password);
+    const { rows: qrTenants } = await authPool.query(
+      `SELECT id FROM auth_tenant.tenants WHERE qr_enabled = true AND status = 'active' AND deleted_at IS NULL`
+    );
 
-    // Upsert into auth_tenant.users
-    const { data: authUser, error: authUserError } = await authSupabase
-      .schema('auth_tenant')
-      .from('users')
-      .upsert({
-        email: normalizedEmail,
-        password_hash: bcryptHash,
-        full_name: record.full_name,
-        phone_number: record.phone_number,
-        phone_country_code: record.phone_country_code,
-        title: record.title,
-        user_role: 'user',
-        active: false,
-        email_verified_at: now,
-        created_at: now,
-        updated_at: now
-      }, { onConflict: 'email' })
-      .select('id')
-      .single();
-
-    if (authUserError) {
-      console.error('[Signup] auth_tenant.users insert error:', authUserError.message);
-    } else if (authUser) {
-      // Link to all QR-enabled tenants
-      const { data: qrTenants } = await authSupabase
-        .schema('auth_tenant')
-        .from('tenants')
-        .select('id')
-        .eq('qr_enabled', true)
-        .eq('status', 'active')
-        .is('deleted_at', null);
-
-      if (qrTenants && qrTenants.length > 0) {
-        const tenantUserRows = qrTenants.map(t => ({
-          tenant_id: t.id,
-          user_id: authUser.id,
-          role: 'member',
-          status: 'active',
-          created_at: now,
-          updated_at: now
-        }));
-
-        const { error: tuError } = await authSupabase
-          .schema('auth_tenant')
-          .from('tenant_users')
-          .insert(tenantUserRows);
-
-        if (tuError) {
+    if (qrTenants && qrTenants.length > 0) {
+      for (const t of qrTenants) {
+        try {
+          await authPool.query(
+            `INSERT INTO auth_tenant.tenant_users (tenant_id, user_id, role, status, created_at, updated_at)
+             VALUES ($1, $2, 'member', 'active', $3, $3)`,
+            [t.id, userId, now]
+          );
+        } catch (tuError) {
           console.error('[Signup] auth_tenant.tenant_users insert error:', tuError.message);
         }
       }
@@ -669,9 +536,9 @@ async function setPasswordAndComplete(email, password) {
   }
 
   // Clean up pending record and OTPs
-  await supabase.from('signup_pending').delete().eq('email', normalizedEmail);
-  await supabase.from('signup_otps').delete().eq('identifier', normalizedEmail);
-  await supabase.from('signup_otps').delete().eq('identifier', fullPhone);
+  await pool.query('DELETE FROM signup_pending WHERE email = $1', [normalizedEmail]);
+  await pool.query('DELETE FROM signup_otps WHERE identifier = $1', [normalizedEmail]);
+  await pool.query('DELETE FROM signup_otps WHERE identifier = $1', [fullPhone]);
 
   return {
     success: true,

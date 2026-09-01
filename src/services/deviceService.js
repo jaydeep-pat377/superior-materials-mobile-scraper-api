@@ -1,4 +1,4 @@
-const { getSupabaseAdmin: getSupabase } = require('../config/database');
+const { getPool } = require('../config/database');
 
 // Configuration
 const MAX_RETRIES = 3;
@@ -18,25 +18,25 @@ const VALID_DEVICE_TYPES = ['android', 'ios', 'web'];
  */
 async function retryWithBackoff(fn, maxRetries = MAX_RETRIES, shouldRetry = null) {
   let lastError = null;
-  
+
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
     try {
       return await fn();
     } catch (error) {
       lastError = error;
-      
+
       // Check if we should retry this error
       if (shouldRetry && !shouldRetry(error)) {
         throw error;
       }
-      
+
       // Don't retry validation errors or duplicate constraint violations
-      if (error.message?.includes('validation') || 
+      if (error.message?.includes('validation') ||
           error.message?.includes('duplicate') ||
           error.code === '23505') { // PostgreSQL unique violation
         throw error;
       }
-      
+
       // If not the last attempt, wait before retrying
       if (attempt < maxRetries) {
         const delay = RETRY_DELAY_BASE * attempt; // Exponential backoff: 1s, 2s, 3s
@@ -46,7 +46,7 @@ async function retryWithBackoff(fn, maxRetries = MAX_RETRIES, shouldRetry = null
       }
     }
   }
-  
+
   throw lastError || new Error('Operation failed after all retries');
 }
 
@@ -81,7 +81,7 @@ function validateDeviceToken(deviceToken) {
  */
 function validateAndSanitizeDeviceInfo(deviceInfo) {
   const sanitized = {};
-  
+
   // Validate device_type
   if (deviceInfo.device_type) {
     const deviceType = deviceInfo.device_type.toLowerCase().trim();
@@ -91,7 +91,7 @@ function validateAndSanitizeDeviceInfo(deviceInfo) {
       throw new Error(`Invalid device_type. Must be one of: ${VALID_DEVICE_TYPES.join(', ')}`);
     }
   }
-  
+
   // Sanitize string fields (prevent XSS, limit length)
   const stringFields = ['device_name', 'device_model', 'os_version', 'app_version'];
   stringFields.forEach(field => {
@@ -105,7 +105,7 @@ function validateAndSanitizeDeviceInfo(deviceInfo) {
       sanitized[field] = value || null;
     }
   });
-  
+
   return sanitized;
 }
 
@@ -132,45 +132,39 @@ async function registerOrUpdateDevice(userId, deviceInfo) {
     if (!deviceInfo.device_token) {
       throw new Error('device_token is required');
     }
-    
+
     // Validate device token format
     if (!validateDeviceToken(deviceInfo.device_token)) {
       throw new Error('Invalid device_token format');
     }
-    
+
     // Validate and sanitize device info
     const sanitized = validateAndSanitizeDeviceInfo(deviceInfo);
-    
+
     // Use device_token as device_id if not provided
     const deviceId = deviceInfo.device_id || deviceInfo.device_token;
-    
-    const supabase = getSupabase();
+
+    const pool = getPool();
     const now = new Date().toISOString();
-    
-    // Check if device_token already exists (may have duplicates, so use limit(1))
+
+    // Check if device_token already exists (may have duplicates, so use limit 1)
     const checkDevice = async () => {
-      const { data, error: checkError } = await supabase
-        .from('user_devices')
-        .select('id, user_id')
-        .eq('device_token', deviceInfo.device_token)
-        .limit(1);
-
-      if (checkError) {
-        throw new Error(`Error checking device: ${checkError.message}`);
-      }
-
-      return data && data.length > 0 ? data[0] : null;
+      const { rows } = await pool.query(
+        'SELECT id, user_id FROM user_devices WHERE device_token = $1 LIMIT 1',
+        [deviceInfo.device_token]
+      );
+      return rows.length > 0 ? rows[0] : null;
     };
-    
+
     const existingDevice = await retryWithBackoff(checkDevice);
-    
+
     // If device_token exists, check if it belongs to a different user (security check)
     if (existingDevice && existingDevice.user_id !== userId) {
-      console.warn(`⚠️  Security: Device token ${deviceInfo.device_token.substring(0, 20)}... is being reused by different user. Original user: ${existingDevice.user_id}, New user: ${userId}`);
+      console.warn(`Security: Device token ${deviceInfo.device_token.substring(0, 20)}... is being reused by different user. Original user: ${existingDevice.user_id}, New user: ${userId}`);
       // Log security event but allow update (token refresh scenario)
       // The token will be updated to the new user
     }
-    
+
     const deviceData = {
       user_id: userId,
       device_token: deviceInfo.device_token.trim(),
@@ -183,99 +177,102 @@ async function registerOrUpdateDevice(userId, deviceInfo) {
       is_active: true,
       last_active_at: now
     };
-    
+
     let result;
-    
+
     if (existingDevice) {
       // Update existing device by device_token (may match multiple rows)
       const updateDevice = async () => {
-        const { data, error } = await supabase
-          .from('user_devices')
-          .update(deviceData)
-          .eq('device_token', deviceInfo.device_token)
-          .select()
-          .limit(1);
-
-        if (error) {
-          throw new Error(`Error updating device: ${error.message}`);
-        }
-
-        return data && data.length > 0 ? data[0] : null;
+        const { rows } = await pool.query(
+          `UPDATE user_devices
+           SET user_id = $1, device_token = $2, device_id = $3, device_type = $4,
+               device_name = $5, device_model = $6, os_version = $7, app_version = $8,
+               is_active = $9, last_active_at = $10
+           WHERE device_token = $2
+           RETURNING *`,
+          [
+            deviceData.user_id, deviceData.device_token, deviceData.device_id,
+            deviceData.device_type, deviceData.device_name, deviceData.device_model,
+            deviceData.os_version, deviceData.app_version, deviceData.is_active,
+            deviceData.last_active_at
+          ]
+        );
+        return rows.length > 0 ? rows[0] : null;
       };
-      
+
       result = await retryWithBackoff(updateDevice);
-      console.log(`✅ Device updated: ${deviceInfo.device_token.substring(0, 20)}... for user ${userId}`);
+      console.log(`Device updated: ${deviceInfo.device_token.substring(0, 20)}... for user ${userId}`);
     } else {
       // Check device limit before inserting
-      const { data: userDevices, error: countError } = await supabase
-        .from('user_devices')
-        .select('id', { count: 'exact' })
-        .eq('user_id', userId)
-        .eq('is_active', true);
-      
-      if (!countError && userDevices && userDevices.length >= MAX_DEVICES_PER_USER) {
+      const { rows: userDevices } = await pool.query(
+        'SELECT id FROM user_devices WHERE user_id = $1 AND is_active = true',
+        [userId]
+      );
+
+      if (userDevices && userDevices.length >= MAX_DEVICES_PER_USER) {
         // Deactivate oldest inactive device or oldest active device
-        const { data: oldestDevices } = await supabase
-          .from('user_devices')
-          .select('id')
-          .eq('user_id', userId)
-          .order('last_active_at', { ascending: true })
-          .limit(1);
+        const { rows: oldestDevices } = await pool.query(
+          'SELECT id FROM user_devices WHERE user_id = $1 ORDER BY last_active_at ASC LIMIT 1',
+          [userId]
+        );
 
         const oldestDevice = oldestDevices && oldestDevices.length > 0 ? oldestDevices[0] : null;
         if (oldestDevice) {
-          await supabase
-            .from('user_devices')
-            .update({ is_active: false })
-            .eq('id', oldestDevice.id);
-          
-          console.log(`⚠️  Device limit reached for user ${userId}, deactivated oldest device`);
+          await pool.query(
+            'UPDATE user_devices SET is_active = false WHERE id = $1',
+            [oldestDevice.id]
+          );
+
+          console.log(`Device limit reached for user ${userId}, deactivated oldest device`);
         }
       }
-      
+
       // Insert new device
       const insertDevice = async () => {
-        const insertData = {
-          ...deviceData,
-          created_at: now
-        };
-        
-        const { data, error } = await supabase
-          .from('user_devices')
-          .insert(insertData)
-          .select()
-          .single();
-        
-        if (error) {
+        try {
+          const { rows } = await pool.query(
+            `INSERT INTO user_devices (user_id, device_token, device_id, device_type, device_name, device_model, os_version, app_version, is_active, last_active_at, created_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+             RETURNING *`,
+            [
+              deviceData.user_id, deviceData.device_token, deviceData.device_id,
+              deviceData.device_type, deviceData.device_name, deviceData.device_model,
+              deviceData.os_version, deviceData.app_version, deviceData.is_active,
+              deviceData.last_active_at, now
+            ]
+          );
+          return rows[0];
+        } catch (error) {
           // Handle duplicate token error gracefully
           if (error.code === '23505' || error.message?.includes('duplicate')) {
             // Token was inserted between check and insert, try update instead
-            const { data: updatedData, error: updateError } = await supabase
-              .from('user_devices')
-              .update(deviceData)
-              .eq('device_token', deviceInfo.device_token.trim())
-              .select()
-              .limit(1);
-
-            if (updateError) {
-              throw new Error(`Error registering device: ${updateError.message}`);
-            }
-
-            return updatedData && updatedData.length > 0 ? updatedData[0] : null;
+            const { rows } = await pool.query(
+              `UPDATE user_devices
+               SET user_id = $1, device_id = $3, device_type = $4,
+                   device_name = $5, device_model = $6, os_version = $7, app_version = $8,
+                   is_active = $9, last_active_at = $10
+               WHERE device_token = $2
+               RETURNING *`,
+              [
+                deviceData.user_id, deviceData.device_token, deviceData.device_id,
+                deviceData.device_type, deviceData.device_name, deviceData.device_model,
+                deviceData.os_version, deviceData.app_version, deviceData.is_active,
+                deviceData.last_active_at
+              ]
+            );
+            return rows.length > 0 ? rows[0] : null;
           }
-          throw new Error(`Error registering device: ${error.message}`);
+          throw error;
         }
-        
-        return data;
       };
-      
+
       result = await retryWithBackoff(insertDevice);
-      console.log(`✅ Device registered: ${deviceInfo.device_token.substring(0, 20)}... for user ${userId}`);
+      console.log(`Device registered: ${deviceInfo.device_token.substring(0, 20)}... for user ${userId}`);
     }
-    
+
     return result;
   } catch (error) {
-    console.error('❌ Device registration error:', error.message);
+    console.error('Device registration error:', error.message);
     throw error;
   }
 }
@@ -290,35 +287,28 @@ async function deactivateDeviceToken(deviceToken) {
     if (!deviceToken) {
       throw new Error('device_token is required');
     }
-    
-    const supabase = getSupabase();
-    
+
+    const pool = getPool();
+
     const deactivate = async () => {
-      const { data, error } = await supabase
-        .from('user_devices')
-        .update({ is_active: false })
-        .eq('device_token', deviceToken)
-        .select('id')
-        .limit(1);
-
-      if (error) {
-        throw new Error(`Error deactivating device: ${error.message}`);
-      }
-
-      return data && data.length > 0;
+      const { rows } = await pool.query(
+        'UPDATE user_devices SET is_active = false WHERE device_token = $1 RETURNING id',
+        [deviceToken]
+      );
+      return rows.length > 0;
     };
-    
+
     const success = await retryWithBackoff(deactivate);
-    
+
     if (success) {
-      console.log(`✅ Device token deactivated: ${deviceToken.substring(0, 20)}...`);
+      console.log(`Device token deactivated: ${deviceToken.substring(0, 20)}...`);
     } else {
-      console.log(`⚠️  Device token not found for deactivation: ${deviceToken.substring(0, 20)}...`);
+      console.log(`Device token not found for deactivation: ${deviceToken.substring(0, 20)}...`);
     }
-    
+
     return success;
   } catch (error) {
-    console.error('❌ Error deactivating device token:', error.message);
+    console.error('Error deactivating device token:', error.message);
     throw error;
   }
 }
@@ -334,24 +324,22 @@ async function deactivateUserDeviceToken(userId, deviceToken) {
     if (!userId || !deviceToken) {
       throw new Error('user_id and device_token are required');
     }
-    
-    const supabase = getSupabase();
-    
-    // Verify token belongs to user before deactivating
-    const { data: devices, error: checkError } = await supabase
-      .from('user_devices')
-      .select('id')
-      .eq('device_token', deviceToken)
-      .eq('user_id', userId)
-      .limit(1);
 
-    if (checkError || !devices || devices.length === 0) {
+    const pool = getPool();
+
+    // Verify token belongs to user before deactivating
+    const { rows: devices } = await pool.query(
+      'SELECT id FROM user_devices WHERE device_token = $1 AND user_id = $2 LIMIT 1',
+      [deviceToken, userId]
+    );
+
+    if (!devices || devices.length === 0) {
       throw new Error('Device token not found or does not belong to user');
     }
-    
+
     return await deactivateDeviceToken(deviceToken);
   } catch (error) {
-    console.error('❌ Error deactivating user device token:', error.message);
+    console.error('Error deactivating user device token:', error.message);
     throw error;
   }
 }
@@ -366,30 +354,23 @@ async function deactivateAllUserDevices(userId) {
     if (!userId) {
       throw new Error('user_id is required');
     }
-    
-    const supabase = getSupabase();
-    
+
+    const pool = getPool();
+
     const deactivate = async () => {
-      const { data, error } = await supabase
-        .from('user_devices')
-        .update({ is_active: false })
-        .eq('user_id', userId)
-        .eq('is_active', true)
-        .select('id');
-      
-      if (error) {
-        throw new Error(`Error deactivating devices: ${error.message}`);
-      }
-      
-      return data?.length || 0;
+      const { rows } = await pool.query(
+        'UPDATE user_devices SET is_active = false WHERE user_id = $1 AND is_active = true RETURNING id',
+        [userId]
+      );
+      return rows.length;
     };
-    
+
     const count = await retryWithBackoff(deactivate);
-    console.log(`✅ Deactivated ${count} device(s) for user ${userId}`);
-    
+    console.log(`Deactivated ${count} device(s) for user ${userId}`);
+
     return count;
   } catch (error) {
-    console.error('❌ Error deactivating all user devices:', error.message);
+    console.error('Error deactivating all user devices:', error.message);
     throw error;
   }
 }
@@ -401,10 +382,10 @@ async function deactivateAllUserDevices(userId) {
  */
 async function handleInvalidToken(deviceToken) {
   try {
-    console.log(`🔧 Handling invalid token: ${deviceToken.substring(0, 20)}...`);
+    console.log(`Handling invalid token: ${deviceToken.substring(0, 20)}...`);
     return await deactivateDeviceToken(deviceToken);
   } catch (error) {
-    console.error('❌ Error handling invalid token:', error.message);
+    console.error('Error handling invalid token:', error.message);
     // Don't throw - this is cleanup, shouldn't break the flow
     return false;
   }
@@ -420,27 +401,20 @@ async function getUserDevices(userId) {
     if (!userId) {
       throw new Error('user_id is required');
     }
-    
-    const supabase = getSupabase();
-    
+
+    const pool = getPool();
+
     const fetchDevices = async () => {
-      const { data, error } = await supabase
-        .from('user_devices')
-        .select('*')
-        .eq('user_id', userId)
-        .eq('is_active', true)
-        .order('last_active_at', { ascending: false });
-      
-      if (error) {
-        throw new Error(`Error fetching devices: ${error.message}`);
-      }
-      
-      return data || [];
+      const { rows } = await pool.query(
+        'SELECT * FROM user_devices WHERE user_id = $1 AND is_active = true ORDER BY last_active_at DESC',
+        [userId]
+      );
+      return rows;
     };
-    
+
     return await retryWithBackoff(fetchDevices);
   } catch (error) {
-    console.error('❌ Error fetching user devices:', error.message);
+    console.error('Error fetching user devices:', error.message);
     throw error;
   }
 }
@@ -469,26 +443,21 @@ async function batchGetUserDeviceTokens(userIds) {
     if (!Array.isArray(userIds) || userIds.length === 0) {
       return {};
     }
-    
-    const supabase = getSupabase();
-    
-    const { data, error } = await supabase
-      .from('user_devices')
-      .select('user_id, device_token')
-      .in('user_id', userIds)
-      .eq('is_active', true);
-    
-    if (error) {
-      throw new Error(`Error batch fetching device tokens: ${error.message}`);
-    }
-    
+
+    const pool = getPool();
+
+    const { rows } = await pool.query(
+      'SELECT user_id, device_token FROM user_devices WHERE user_id = ANY($1) AND is_active = true',
+      [userIds]
+    );
+
     // Group by user_id
     const result = {};
     userIds.forEach(userId => {
       result[userId] = [];
     });
-    
-    (data || []).forEach(device => {
+
+    (rows || []).forEach(device => {
       if (device.device_token) {
         if (!result[device.user_id]) {
           result[device.user_id] = [];
@@ -496,10 +465,10 @@ async function batchGetUserDeviceTokens(userIds) {
         result[device.user_id].push(device.device_token);
       }
     });
-    
+
     return result;
   } catch (error) {
-    console.error('❌ Error batch fetching device tokens:', error.message);
+    console.error('Error batch fetching device tokens:', error.message);
     throw error;
   }
 }
@@ -514,39 +483,32 @@ async function batchDeactivateTokens(deviceTokens) {
     if (!Array.isArray(deviceTokens) || deviceTokens.length === 0) {
       return 0;
     }
-    
-    const supabase = getSupabase();
-    
+
+    const pool = getPool();
+
     // Process in batches of 100 to avoid query size limits
     const batchSize = 100;
     let totalDeactivated = 0;
-    
+
     for (let i = 0; i < deviceTokens.length; i += batchSize) {
       const batch = deviceTokens.slice(i, i + batchSize);
-      
+
       const deactivate = async () => {
-        const { data, error } = await supabase
-          .from('user_devices')
-          .update({ is_active: false })
-          .in('device_token', batch)
-          .eq('is_active', true)
-          .select('id');
-        
-        if (error) {
-          throw new Error(`Error batch deactivating tokens: ${error.message}`);
-        }
-        
-        return data?.length || 0;
+        const { rows } = await pool.query(
+          'UPDATE user_devices SET is_active = false WHERE device_token = ANY($1) AND is_active = true RETURNING id',
+          [batch]
+        );
+        return rows.length;
       };
-      
+
       const count = await retryWithBackoff(deactivate);
       totalDeactivated += count;
     }
-    
-    console.log(`✅ Batch deactivated ${totalDeactivated} device token(s)`);
+
+    console.log(`Batch deactivated ${totalDeactivated} device token(s)`);
     return totalDeactivated;
   } catch (error) {
-    console.error('❌ Error batch deactivating tokens:', error.message);
+    console.error('Error batch deactivating tokens:', error.message);
     throw error;
   }
 }
@@ -558,64 +520,54 @@ async function batchDeactivateTokens(deviceTokens) {
  */
 async function cleanupInactiveTokens(daysOld = TOKEN_CLEANUP_DAYS) {
   try {
-    const supabase = getSupabase();
+    const pool = getPool();
     const cutoffDate = new Date();
     cutoffDate.setDate(cutoffDate.getDate() - daysOld);
     const cutoffISO = cutoffDate.toISOString();
-    
-    console.log(`🧹 Starting cleanup of inactive tokens older than ${daysOld} days (before ${cutoffISO})`);
-    
+
+    console.log(`Starting cleanup of inactive tokens older than ${daysOld} days (before ${cutoffISO})`);
+
     // Process in batches to avoid large deletions
     const batchSize = 1000;
     let totalDeleted = 0;
     let hasMore = true;
-    
+
     while (hasMore) {
       const cleanup = async () => {
         // First, get IDs of tokens to delete
-        const { data: tokensToDelete, error: selectError } = await supabase
-          .from('user_devices')
-          .select('id')
-          .eq('is_active', false)
-          .lt('last_active_at', cutoffISO)
-          .limit(batchSize);
-        
-        if (selectError) {
-          throw new Error(`Error selecting tokens for cleanup: ${selectError.message}`);
-        }
-        
+        const { rows: tokensToDelete } = await pool.query(
+          'SELECT id FROM user_devices WHERE is_active = false AND last_active_at < $1 LIMIT $2',
+          [cutoffISO, batchSize]
+        );
+
         if (!tokensToDelete || tokensToDelete.length === 0) {
           hasMore = false;
           return 0;
         }
-        
+
         const ids = tokensToDelete.map(t => t.id);
-        
+
         // Delete the tokens
-        const { error: deleteError } = await supabase
-          .from('user_devices')
-          .delete()
-          .in('id', ids);
-        
-        if (deleteError) {
-          throw new Error(`Error deleting tokens: ${deleteError.message}`);
-        }
-        
+        await pool.query(
+          'DELETE FROM user_devices WHERE id = ANY($1)',
+          [ids]
+        );
+
         return ids.length;
       };
-      
+
       const deleted = await retryWithBackoff(cleanup);
       totalDeleted += deleted;
-      
+
       if (deleted < batchSize) {
         hasMore = false;
       }
     }
-    
-    console.log(`✅ Cleanup complete: Deleted ${totalDeleted} inactive token(s)`);
+
+    console.log(`Cleanup complete: Deleted ${totalDeleted} inactive token(s)`);
     return totalDeleted;
   } catch (error) {
-    console.error('❌ Error cleaning up inactive tokens:', error.message);
+    console.error('Error cleaning up inactive tokens:', error.message);
     throw error;
   }
 }

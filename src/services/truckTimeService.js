@@ -2,12 +2,12 @@
  * Truck Time Service
  *
  * Validates email sending windows based on truck schedules.
- * Integrates with the Supabase Edge Function to get first/last truck times.
+ * Integrates with the Edge Function to get first/last truck times.
  */
 
 // Configuration
-const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY || process.env.SUPABASE_SERVICE_KEY;
+const TRUCK_TIMES_API_URL = process.env.TRUCK_TIMES_API_URL;
+const TRUCK_TIMES_API_KEY = process.env.TRUCK_TIMES_API_KEY;
 const BUSINESS_TIMEZONE = process.env.BUSINESS_TIMEZONE || 'America/Chicago';
 const EMAIL_TIME_WINDOW_ENABLED = process.env.EMAIL_TIME_WINDOW_ENABLED !== 'false';
 const EMAIL_TIME_WINDOW_BUFFER_MINUTES = parseInt(process.env.EMAIL_TIME_WINDOW_BUFFER_MINUTES) || 0;
@@ -50,18 +50,18 @@ function formatTimeInTimezone(date = new Date()) {
 }
 
 /**
- * Fetch daily truck times from Supabase Edge Function
+ * Fetch daily truck times from Edge Function
  * @param {string} date - Date in YYYY-MM-DD format
  * @returns {Promise<Object>} Truck times response
  */
 async function getDailyTruckTimes(date) {
-  if (!SUPABASE_URL || !SUPABASE_ANON_KEY) {
-    console.error('Supabase configuration missing for truck times API');
+  if (!TRUCK_TIMES_API_URL || !TRUCK_TIMES_API_KEY) {
+    console.error('Truck times API configuration missing (TRUCK_TIMES_API_URL, TRUCK_TIMES_API_KEY)');
     return {
       date,
       first_truck_time: null,
       last_truck_time: null,
-      error: 'Supabase configuration missing'
+      error: 'Truck times API configuration missing'
     };
   }
 
@@ -76,12 +76,11 @@ async function getDailyTruckTimes(date) {
     const timeoutId = setTimeout(() => controller.abort(), 10000); // 10 second timeout
 
     const response = await fetch(
-      `${SUPABASE_URL}/functions/v1/get-daily-truck-times?date=${date}`,
+      `${TRUCK_TIMES_API_URL}?date=${date}`,
       {
         method: 'GET',
         headers: {
-          'Authorization': `Bearer ${SUPABASE_ANON_KEY}`,
-          'apikey': SUPABASE_ANON_KEY,
+          'Authorization': `Bearer ${TRUCK_TIMES_API_KEY}`,
           'Content-Type': 'application/json',
         },
         signal: controller.signal

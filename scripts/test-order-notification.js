@@ -8,7 +8,7 @@
 
 require('dotenv').config();
 
-const { getSupabaseAdmin: getSupabase } = require('../src/config/database');
+const { getPool } = require('../src/config/database');
 const { getMessaging } = require('../src/config/Firebase');
 
 const TOKEN_ARG = process.argv[2]; // optional: pass token as CLI arg
@@ -57,17 +57,20 @@ async function run() {
   }
 
   // Otherwise list devices and send to the latest
-  const supabase = getSupabase();
+  const pool = getPool();
 
-  const { data: devices, error } = await supabase
-    .from('user_devices')
-    .select('id, user_id, device_token, device_type, device_name, last_active_at')
-    .eq('is_active', true)
-    .order('last_active_at', { ascending: false })
-    .limit(10);
-
-  if (error) {
-    console.error('Error querying user_devices:', error.message);
+  let devices;
+  try {
+    const { rows } = await pool.query(
+      `SELECT id, user_id, device_token, device_type, device_name, last_active_at
+       FROM user_devices
+       WHERE is_active = true
+       ORDER BY last_active_at DESC
+       LIMIT 10`
+    );
+    devices = rows;
+  } catch (err) {
+    console.error('Error querying user_devices:', err.message);
     return;
   }
 

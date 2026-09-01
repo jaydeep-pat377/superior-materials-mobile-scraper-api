@@ -1,6 +1,6 @@
 const { verifyAccessToken } = require('../utils/jwtUtils');
 const { executeDirectSQL } = require('../utils/postgresExecutor');
-const { getAuthSupabaseAdmin } = require('../config/authDatabase');
+const { getAuthPool } = require('../config/authDatabase');
 
 // Admin role code - same as web app (/src/lib/admin-check.ts)
 const ADMIN_ROLE_CODE = 'tk-admin';
@@ -10,11 +10,11 @@ const DEBUG = process.env.LOG_LEVEL === 'debug';
 
 // In-memory cache for user access data (5-minute TTL)
 const _accessCache = new Map();
-const ACCESS_CACHE_TTL_MS = 5 * 60 * 1000;
+const ACCESS_CACHE_TTL_MS = 30 * 60 * 1000; // 30 minutes
 
 // Short-lived cache for user timezone preferences (30-second TTL for quick updates)
 const _tzPrefCache = new Map();
-const TZ_PREF_CACHE_TTL_MS = 30 * 1000;
+const TZ_PREF_CACHE_TTL_MS = 10 * 60 * 1000; // 10 minutes
 
 // Clean up expired cache entries every 5 minutes
 setInterval(() => {
@@ -181,27 +181,29 @@ async function getAllowedCustomerIdsForUser(userId) {
  * Resolve a UUID user ID to the integer ID used in tenant_users.
  * If the userId is already numeric, returns it as-is.
  */
-async function resolveUserId(supabase, userId) {
+async function resolveUserId(authPool, userId) {
   // If already a number, return directly
   if (typeof userId === 'number' || /^\d+$/.test(userId)) {
     return Number(userId);
   }
 
   // UUID — look up integer id from auth_tenant.users
-  const { data, error } = await supabase
-    .schema('auth_tenant')
-    .from('users')
-    .select('id')
-    .eq('uuid', userId)
-    .is('deleted_at', null)
-    .limit(1);
+  try {
+    const { rows } = await authPool.query(
+      'SELECT id FROM auth_tenant.users WHERE uuid = $1 AND deleted_at IS NULL LIMIT 1',
+      [userId]
+    );
 
-  if (error || !data || data.length === 0) {
+    if (!rows || rows.length === 0) {
+      console.log('[AccessControl] resolveUserId: could not find integer id for UUID:', userId);
+      return null;
+    }
+
+    return rows[0].id;
+  } catch (error) {
     console.log('[AccessControl] resolveUserId: could not find integer id for UUID:', userId, 'error:', error?.message);
     return null;
   }
-
-  return data[0].id;
 }
 
 /**
@@ -214,35 +216,29 @@ const DEFAULT_TIMEZONE = { iana: 'America/Chicago' };
 
 async function getTenantTimezoneForUser(userId) {
   try {
-    const supabase = getAuthSupabaseAdmin();
+    const authPool = getAuthPool();
 
     // Resolve UUID to integer user ID if needed
-    const numericUserId = await resolveUserId(supabase, userId);
+    const numericUserId = await resolveUserId(authPool, userId);
     if (!numericUserId) return DEFAULT_TIMEZONE;
 
     // Step 1: Get tenant_id from tenant_users
-    const { data: tuData, error: tuError } = await supabase
-      .schema('auth_tenant')
-      .from('tenant_users')
-      .select('tenant_id')
-      .eq('user_id', numericUserId)
-      .eq('status', 'active')
-      .limit(1);
+    const { rows: tuData } = await authPool.query(
+      'SELECT tenant_id FROM auth_tenant.tenant_users WHERE user_id = $1 AND status = $2 LIMIT 1',
+      [numericUserId, 'active']
+    );
 
-    if (tuError || !tuData || tuData.length === 0) {
+    if (!tuData || tuData.length === 0) {
       return DEFAULT_TIMEZONE;
     }
 
     // Step 2: Get timezone from tenants
-    const { data: tData, error: tError } = await supabase
-      .schema('auth_tenant')
-      .from('tenants')
-      .select('timezone')
-      .eq('id', tuData[0].tenant_id)
-      .is('deleted_at', null)
-      .limit(1);
+    const { rows: tData } = await authPool.query(
+      'SELECT timezone FROM auth_tenant.tenants WHERE id = $1 AND deleted_at IS NULL LIMIT 1',
+      [tuData[0].tenant_id]
+    );
 
-    if (tError || !tData || tData.length === 0) {
+    if (!tData || tData.length === 0) {
       return DEFAULT_TIMEZONE;
     }
 
@@ -267,39 +263,33 @@ async function getTenantTimezoneForUser(userId) {
  */
 async function getTenantShowRegionForUser(userId) {
   try {
-    const supabase = getAuthSupabaseAdmin();
+    const authPool = getAuthPool();
 
     // Resolve UUID to integer user ID if needed
-    const numericUserId = await resolveUserId(supabase, userId);
+    const numericUserId = await resolveUserId(authPool, userId);
     if (!numericUserId) return false;
 
     // Step 1: Get tenant_id from tenant_users
-    const { data: tuData, error: tuError } = await supabase
-      .schema('auth_tenant')
-      .from('tenant_users')
-      .select('tenant_id')
-      .eq('user_id', numericUserId)
-      .eq('status', 'active')
-      .limit(1);
+    const { rows: tuData } = await authPool.query(
+      'SELECT tenant_id FROM auth_tenant.tenant_users WHERE user_id = $1 AND status = $2 LIMIT 1',
+      [numericUserId, 'active']
+    );
 
-    if (tuError || !tuData || tuData.length === 0) {
-      console.log('[AccessControl] show_regions: no tenant_user found for userId:', userId, 'error:', tuError?.message);
+    if (!tuData || tuData.length === 0) {
+      console.log('[AccessControl] show_regions: no tenant_user found for userId:', userId);
       return false;
     }
 
     console.log('[AccessControl] show_regions: found tenant_id:', tuData[0].tenant_id, 'for userId:', userId);
 
     // Step 2: Get show_regions from tenants
-    const { data: tData, error: tError } = await supabase
-      .schema('auth_tenant')
-      .from('tenants')
-      .select('show_regions')
-      .eq('id', tuData[0].tenant_id)
-      .is('deleted_at', null)
-      .limit(1);
+    const { rows: tData } = await authPool.query(
+      'SELECT show_regions FROM auth_tenant.tenants WHERE id = $1 AND deleted_at IS NULL LIMIT 1',
+      [tuData[0].tenant_id]
+    );
 
-    if (tError || !tData || tData.length === 0) {
-      console.log('[AccessControl] show_regions: no tenant found for tenant_id:', tuData[0].tenant_id, 'error:', tError?.message);
+    if (!tData || tData.length === 0) {
+      console.log('[AccessControl] show_regions: no tenant found for tenant_id:', tuData[0].tenant_id);
       return false;
     }
 
@@ -448,7 +438,8 @@ async function loadUserAccessData(userId, userEmail = null) {
       zoneNames: [],
       customerIds: [],
       projectCodes: [],
-      timezone
+      timezone,
+      effectiveUserId
     };
     if (DEBUG) console.log(`[AccessControl] User ${userId} is ADMIN - full access`);
     _accessCache.set(userId, { data: accessData, timestamp: now });
@@ -518,6 +509,7 @@ async function loadUserAccessData(userId, userEmail = null) {
     if (DEBUG) console.log(`[AccessControl] User ${userId} has NO ACCESS`);
   }
 
+  accessData.effectiveUserId = effectiveUserId;
   _accessCache.set(userId, { data: accessData, timestamp: now });
   return accessData;
 }
@@ -589,6 +581,7 @@ async function authenticate(req, res, next) {
     // Attach user data with access control info - matching web app structure
     req.user = {
       id: decoded.id,
+      effectiveUserId: accessData.effectiveUserId || decoded.id,  // Mapped ID for FK-compatible queries
       email: decoded.email || '',
       phone: decoded.phone || '',
       role: decoded.role || 'authenticated',
@@ -618,14 +611,13 @@ async function authenticate(req, res, next) {
         if (cachedTz && (Date.now() - cachedTz.ts) < TZ_PREF_CACHE_TTL_MS) {
           if (cachedTz.iana) req.user.timezone = { iana: cachedTz.iana };
         } else {
-          const { getSupabaseAdmin } = require('../config/database');
-          const supabase = getSupabaseAdmin();
-          const { data: prefRow } = await supabase
-            .from('user_preferences')
-            .select('preference_value')
-            .eq('user_id', decoded.id)
-            .eq('preference_key', 'timezone')
-            .maybeSingle();
+          const { getPool } = require('../config/database');
+          const pool = getPool();
+          const { rows: prefRows } = await pool.query(
+            'SELECT preference_value FROM user_preferences WHERE user_id = $1 AND preference_key = $2 LIMIT 1',
+            [decoded.id, 'timezone']
+          );
+          const prefRow = prefRows[0] || null;
 
           let iana = null;
           const pv = prefRow?.preference_value;
@@ -639,11 +631,11 @@ async function authenticate(req, res, next) {
               // Numeric ID — look up iana_code from timezones table
               const tzId = typeof pv === 'number' ? pv : Number(pv);
               if (!isNaN(tzId)) {
-                const { data: tzRow } = await supabase
-                  .from('timezones')
-                  .select('iana_code')
-                  .eq('id', tzId)
-                  .maybeSingle();
+                const { rows: tzRows } = await pool.query(
+                  'SELECT iana_code FROM timezones WHERE id = $1 LIMIT 1',
+                  [tzId]
+                );
+                const tzRow = tzRows[0] || null;
                 if (tzRow?.iana_code) iana = tzRow.iana_code;
               }
             }

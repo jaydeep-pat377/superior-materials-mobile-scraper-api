@@ -1,4 +1,4 @@
-import { supabaseServer } from "./_supabase.mjs";
+import pool from "./_db.mjs";
 import { BLOCKED_TABLES } from "./sql-safety.mjs";
 import { getAiRequestContext } from "./audit-log.mjs";
 
@@ -59,34 +59,35 @@ export class UnknownColumnError extends Error {
 }
 
 /**
- * Stage 3: Pre-flight column validation. Calls the _ai_validate_columns RPC
- * (added in migration 20260501000002) before any aggregate / select_rows /
- * count query. If the RPC isn't yet deployed (PGRST202 "function not found"),
- * skips validation gracefully so the codebase works against pre-migration
+ * Stage 3: Pre-flight column validation. Calls the _ai_validate_columns
+ * function (added in migration 20260501000002) before any aggregate /
+ * select_rows / count query. If the function isn't yet deployed, skips
+ * validation gracefully so the codebase works against pre-migration
  * environments too.
  */
 async function validateColumns(table, columns) {
   const cleaned = columns.filter((c) => typeof c === "string" && c.trim().length > 0);
   if (cleaned.length === 0) return;
 
-  const { error } = await supabaseServer.rpc("_ai_validate_columns", {
-    p_table: table,
-    p_columns: cleaned,
-  });
-  if (!error) return;
+  try {
+    await pool.query("SELECT _ai_validate_columns($1, $2)", [table, cleaned]);
+  } catch (err) {
+    const code = err.code || "";
+    const msg = err.message || "";
 
-  // Migration not yet applied — RPC missing. Skip validation silently.
-  if (error.code === "PGRST202" || /function .* does not exist/i.test(error.message)) {
-    return;
+    // Migration not yet applied — function missing. Skip validation silently.
+    if (code === "42883" || /function .* does not exist/i.test(msg)) {
+      return;
+    }
+
+    // Real validation failure — surface as structured error
+    if (code === "22023" || /unknown_column/.test(msg)) {
+      throw new UnknownColumnError(msg);
+    }
+
+    // Any other error: rethrow as-is (network failure etc.)
+    throw new Error(`column validation: ${msg}`);
   }
-
-  // Real validation failure — surface as structured error
-  if (error.code === "22023" || /unknown_column/.test(error.message)) {
-    throw new UnknownColumnError(error.message);
-  }
-
-  // Any other error: rethrow as-is (network failure etc.)
-  throw new Error(`column validation: ${error.message}`);
 }
 
 /**
@@ -112,6 +113,106 @@ function hasColumnCompareFilter(filters) {
   return (filters ?? []).some((f) => COLUMN_COMPARE_OPS.has(f.operator));
 }
 
+/** Identifier safety check — only bare SQL identifiers are allowed. */
+const SQL_IDENT = /^[A-Za-z_][A-Za-z0-9_]*$/;
+
+function assertIdent(name, label) {
+  if (!SQL_IDENT.test(name)) {
+    throw new Error(`Invalid ${label}: ${name}`);
+  }
+}
+
+/**
+ * Build WHERE clause + params array from a filters array.
+ * Returns { clause: string, params: any[], nextIdx: number }.
+ * `startIdx` is the first $N placeholder index to use.
+ */
+function buildWhereClause(filters, startIdx = 1) {
+  const conditions = [];
+  const params = [];
+  let idx = startIdx;
+
+  for (const f of filters ?? []) {
+    assertIdent(f.column, "column");
+
+    switch (f.operator) {
+      case "eq":
+        conditions.push(`"${f.column}" = $${idx}`);
+        params.push(f.value);
+        idx++;
+        break;
+      case "neq":
+        conditions.push(`"${f.column}" != $${idx}`);
+        params.push(f.value);
+        idx++;
+        break;
+      case "gt":
+        conditions.push(`"${f.column}" > $${idx}`);
+        params.push(f.value);
+        idx++;
+        break;
+      case "gte":
+        conditions.push(`"${f.column}" >= $${idx}`);
+        params.push(f.value);
+        idx++;
+        break;
+      case "lt":
+        conditions.push(`"${f.column}" < $${idx}`);
+        params.push(f.value);
+        idx++;
+        break;
+      case "lte":
+        conditions.push(`"${f.column}" <= $${idx}`);
+        params.push(f.value);
+        idx++;
+        break;
+      case "like":
+        conditions.push(`"${f.column}" LIKE $${idx}`);
+        params.push(String(f.value));
+        idx++;
+        break;
+      case "ilike":
+        conditions.push(`"${f.column}" ILIKE $${idx}`);
+        params.push(String(f.value));
+        idx++;
+        break;
+      case "is":
+        if (f.value === null || f.value === undefined || f.value === "null") {
+          conditions.push(`"${f.column}" IS NULL`);
+        } else if (typeof f.value === "boolean") {
+          conditions.push(`"${f.column}" IS $${idx}`);
+          params.push(f.value);
+          idx++;
+        } else {
+          conditions.push(`"${f.column}" = $${idx}`);
+          params.push(f.value);
+          idx++;
+        }
+        break;
+      case "is_null":
+        conditions.push(`"${f.column}" IS NULL`);
+        break;
+      case "is_not_null":
+        conditions.push(`"${f.column}" IS NOT NULL`);
+        break;
+      case "in":
+        conditions.push(`"${f.column}" = ANY($${idx})`);
+        params.push(String(f.value).split(","));
+        idx++;
+        break;
+      default:
+        if (f.value !== undefined) {
+          conditions.push(`"${f.column}" = $${idx}`);
+          params.push(f.value);
+          idx++;
+        }
+    }
+  }
+
+  const clause = conditions.length > 0 ? conditions.join(" AND ") : "TRUE";
+  return { clause, params, nextIdx: idx };
+}
+
 export async function executeTableQuery(
   params
 ) {
@@ -131,81 +232,35 @@ export async function executeTableQuery(
     ...collectFilterColumns(params.filters),
   ]);
 
-  // PostgREST/supabase-js has no native column-vs-column filter syntax. When
-  // any filter uses a column-compare operator, route through the
-  // ai_select_rows RPC which builds the SQL server-side with %I/%I.
+  // Column-compare operators route through the ai_select_rows RPC which
+  // builds the SQL server-side with %I/%I.
   if (hasColumnCompareFilter(params.filters)) {
     return executeRowsViaRpc(params);
   }
 
-  let query = supabaseServer.from(params.table).select(params.select || "*");
+  assertIdent(params.table, "table");
 
-  if (params.filters) {
-    for (const f of params.filters) {
-      switch (f.operator) {
-        case "eq":
-          query = query.eq(f.column, f.value);
-          break;
-        case "neq":
-          query = query.neq(f.column, f.value);
-          break;
-        case "gt":
-          query = query.gt(f.column, f.value);
-          break;
-        case "gte":
-          query = query.gte(f.column, f.value);
-          break;
-        case "lt":
-          query = query.lt(f.column, f.value);
-          break;
-        case "lte":
-          query = query.lte(f.column, f.value);
-          break;
-        case "like":
-          query = query.like(f.column, String(f.value));
-          break;
-        case "ilike":
-          query = query.ilike(f.column, String(f.value));
-          break;
-        case "is":
-          if (f.value === null || f.value === undefined || f.value === "null") {
-            query = query.is(f.column, null);
-          } else if (typeof f.value === "boolean") {
-            query = query.is(f.column, f.value);
-          } else {
-            query = query.eq(f.column, f.value);
-          }
-          break;
-        case "is_null":
-          query = query.is(f.column, null);
-          break;
-        case "is_not_null":
-          query = query.not(f.column, "is", null);
-          break;
-        case "in":
-          query = query.in(f.column, String(f.value).split(","));
-          break;
-        default:
-          if (f.value !== undefined) query = query.eq(f.column, f.value);
-      }
-    }
+  // Build SELECT columns — validate each identifier
+  let selectExpr = "*";
+  if (params.select && params.select !== "*") {
+    const cols = params.select.split(",").map((s) => s.trim());
+    for (const c of cols) assertIdent(c, "select column");
+    selectExpr = cols.map((c) => `"${c}"`).join(", ");
   }
+
+  const { clause, params: whereParams, nextIdx } = buildWhereClause(params.filters);
+
+  let sql = `SELECT ${selectExpr} FROM "${params.table}" WHERE ${clause}`;
 
   if (params.order) {
-    query = query.order(params.order.column, {
-      ascending: params.order.ascending ?? false,
-    });
+    assertIdent(params.order.column, "order column");
+    sql += ` ORDER BY "${params.order.column}" ${params.order.ascending === true ? "ASC" : "DESC"}`;
   }
 
-  query = query.limit(params.limit || 10);
+  sql += ` LIMIT $${nextIdx}`;
+  whereParams.push(params.limit || 10);
 
-  const { data, error } = await query;
-
-  if (error) {
-    throw new Error(error.message);
-  }
-
-  const rows = data ?? [];
+  const { rows } = await pool.query(sql, whereParams);
   const columns = rows.length > 0 ? Object.keys(rows[0]) : [];
   return { columns, rows };
 }
@@ -221,28 +276,25 @@ function filtersToJsonb(filters) {
 
 /**
  * Routes executeTableQuery through the ai_select_rows RPC when filters
- * include column-compare operators (eq_col, gt_col, etc.). PostgREST has
- * no native syntax for column-vs-column predicates, so we let Postgres
- * build the WHERE clause via the RPC's safe identifier-only path.
+ * include column-compare operators (eq_col, gt_col, etc.). The RPC
+ * builds the WHERE clause via safe identifier-only path.
  */
 async function executeRowsViaRpc(
   params,
 ) {
-  const { data, error } = await supabaseServer.rpc("ai_select_rows", {
-    p_table: params.table,
-    p_filters: filtersToJsonb(params.filters),
-    p_select: params.select ?? "*",
-    p_order_col: params.order?.column ?? null,
-    p_order_asc: params.order?.ascending ?? false,
-    p_limit: params.limit ?? 10,
-  });
+  const { rows: data } = await pool.query(
+    "SELECT * FROM ai_select_rows($1, $2, $3, $4, $5, $6)",
+    [
+      params.table,
+      JSON.stringify(filtersToJsonb(params.filters)),
+      params.select ?? "*",
+      params.order?.column ?? null,
+      params.order?.ascending ?? false,
+      params.limit ?? 10,
+    ],
+  );
 
-  if (error) {
-    throw new Error(`ai_select_rows: ${error.message}`);
-  }
-
-  // ai_select_rows returns SETOF JSONB — each row is already a json object.
-  const rows = (data ?? []) ?? [];
+  const rows = data ?? [];
   const columns = rows.length > 0 ? Object.keys(rows[0]) : [];
   return { columns, rows };
 }
@@ -263,22 +315,21 @@ export async function executeAggregate(
     ...collectFilterColumns(params.filters),
   ]);
 
-  const { data, error } = await supabaseServer.rpc("ai_aggregate", {
-    p_table: params.table,
-    p_filters: filtersToJsonb(params.filters),
-    p_group_by: params.groupBy ?? null,
-    p_method: params.method,
-    p_value_col: params.valueColumn ?? null,
-    p_date_format: params.dateFormat ?? null,
-    p_sort: params.sort ?? null,
-    p_limit: params.limit ?? 500,
-    p_top_n: params.topN ?? null,
-    p_outer_method: params.outerMethod ?? null,
-  });
-
-  if (error) {
-    throw new Error(`ai_aggregate: ${error.message}`);
-  }
+  const { rows: data } = await pool.query(
+    "SELECT * FROM ai_aggregate($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+    [
+      params.table,
+      JSON.stringify(filtersToJsonb(params.filters)),
+      params.groupBy ?? null,
+      params.method,
+      params.valueColumn ?? null,
+      params.dateFormat ?? null,
+      params.sort ?? null,
+      params.limit ?? 500,
+      params.topN ?? null,
+      params.outerMethod ?? null,
+    ],
+  );
 
   const rows = (data ?? []).map(
     (r) => ({ key: r.key, value: Number(r.value) })
@@ -295,14 +346,12 @@ export async function executeCount(params) {
   // Stage 3: pre-validate filter column references.
   await validateColumns(params.table, collectFilterColumns(params.filters));
 
-  const { data, error } = await supabaseServer.rpc("ai_count", {
-    p_table: params.table,
-    p_filters: filtersToJsonb(params.filters),
-  });
+  const { rows } = await pool.query(
+    "SELECT * FROM ai_count($1, $2)",
+    [params.table, JSON.stringify(filtersToJsonb(params.filters))],
+  );
 
-  if (error) {
-    throw new Error(`ai_count: ${error.message}`);
-  }
-
-  return Number(data ?? 0);
+  // ai_count returns a single scalar value
+  const result = rows[0];
+  return Number(result?.ai_count ?? result?.[Object.keys(result || {})[0]] ?? 0);
 }

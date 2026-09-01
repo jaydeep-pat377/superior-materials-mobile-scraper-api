@@ -1,6 +1,6 @@
 require('dotenv').config();
 const { executeDirectSQL } = require('../src/utils/postgresExecutor');
-const { getAuthSupabaseAdmin } = require('../src/config/authDatabase');
+const { getAuthPool } = require('../src/config/authDatabase');
 
 const JWT_ID = process.argv[2] || 'a4e036da-b592-441e-814f-d18b9275c3b3';
 const EMAIL  = process.argv[3] || 'jaydeep@truckcast.com';
@@ -10,9 +10,11 @@ const EMAIL  = process.argv[3] || 'jaydeep@truckcast.com';
   console.log('email:      ', EMAIL, '\n');
 
   // 1. Look up in auth_tenant.users (federated auth DB)
-  const sb = getAuthSupabaseAdmin();
-  const { data: authUsers } = await sb.schema('auth_tenant').from('users')
-    .select('id, uuid, email, full_name').eq('email', EMAIL).limit(5);
+  const authPool = getAuthPool();
+  const { rows: authUsers } = await authPool.query(
+    'SELECT id, uuid, email, full_name FROM auth_tenant.users WHERE email = $1 LIMIT 5',
+    [EMAIL]
+  );
   console.log('auth_tenant.users by email:', authUsers);
 
   // 2. Look up in MAIN DB by UUID (this is what user_roles/user_customers key on)
@@ -22,7 +24,7 @@ const EMAIL  = process.argv[3] || 'jaydeep@truckcast.com';
   `, []);
   console.log('\nMain-DB "users" tables found:', mainByUuid.data);
 
-  // 3. Try auth.users (Supabase auth) by email
+  // 3. Try auth.users by email
   try {
     const authAuth = await executeDirectSQL(`SELECT id, email FROM auth.users WHERE email = $1 LIMIT 5`, [EMAIL]);
     console.log('\nmain auth.users by email:', authAuth.data);

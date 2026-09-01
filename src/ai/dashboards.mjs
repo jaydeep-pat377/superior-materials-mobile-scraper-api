@@ -1,102 +1,105 @@
 /**
  * Saved & shared dashboards (ported from the web app's /api/ai/dashboards
- * routes). Backed by the shared Supabase tables `ai_dashboards` and
- * `ai_dashboard_shares`. All ownership is keyed by the JWT user id.
+ * routes). Backed by the `ai_dashboards` and `ai_dashboard_shares` tables.
+ * All ownership is keyed by the JWT user id.
  */
 
-import { supabaseServer } from './_supabase.mjs';
+import pool from './_db.mjs';
 
 export async function listDashboards(userId) {
-  const ownedRes = await supabaseServer
-    .from('ai_dashboards')
-    .select('id, title, thread_id, is_public, share_token, updated_at, created_at')
-    .eq('user_id', userId)
-    .order('updated_at', { ascending: false })
-    .limit(200);
-  if (ownedRes.error) throw new Error(ownedRes.error.message);
+  const { rows: owned } = await pool.query(
+    'SELECT id, title, thread_id, is_public, share_token, updated_at, created_at FROM ai_dashboards WHERE user_id = $1 ORDER BY updated_at DESC LIMIT 200',
+    [userId],
+  );
 
-  const sharesRes = await supabaseServer
-    .from('ai_dashboard_shares')
-    .select('dashboard_id, ai_dashboards!inner(id, title, user_id, thread_id, updated_at, created_at)')
-    .eq('shared_with_user_id', userId);
-  // Sharing is optional — degrade gracefully if the table is absent.
-  const shared = sharesRes.error ? [] : (sharesRes.data ?? []);
+  let shared = [];
+  try {
+    const { rows } = await pool.query(
+      `SELECT s.dashboard_id, d.id, d.title, d.user_id, d.thread_id, d.updated_at, d.created_at
+       FROM ai_dashboard_shares s
+       INNER JOIN ai_dashboards d ON d.id = s.dashboard_id
+       WHERE s.shared_with_user_id = $1`,
+      [userId],
+    );
+    shared = rows;
+  } catch {
+    // Sharing is optional — degrade gracefully if the table is absent.
+  }
 
-  return { owned: ownedRes.data ?? [], shared };
+  return { owned, shared };
 }
 
 export async function saveDashboard(userId, body) {
   if (!body || !body.title || !Array.isArray(body.widgets)) {
     throw new Error('title and widgets required');
   }
-  const { data, error } = await supabaseServer
-    .from('ai_dashboards')
-    .insert({
-      user_id: userId,
-      title: body.title,
-      layout: body.layout ?? {},
-      widgets: body.widgets,
-      thread_id: body.threadId ?? null,
-    })
-    .select('id, title, updated_at, created_at')
-    .single();
-  if (error) throw new Error(error.message);
-  return data;
+  const { rows } = await pool.query(
+    'INSERT INTO ai_dashboards (user_id, title, layout, widgets, thread_id) VALUES ($1, $2, $3, $4, $5) RETURNING id, title, updated_at, created_at',
+    [userId, body.title, JSON.stringify(body.layout ?? {}), JSON.stringify(body.widgets), body.threadId ?? null],
+  );
+  return rows[0];
 }
 
 async function dashboardReadable(userId, dashboardId) {
-  const { data: dash } = await supabaseServer
-    .from('ai_dashboards')
-    .select('id, user_id, is_public')
-    .eq('id', dashboardId)
-    .single();
+  const { rows: dashRows } = await pool.query(
+    'SELECT id, user_id, is_public FROM ai_dashboards WHERE id = $1 LIMIT 1',
+    [dashboardId],
+  );
+  const dash = dashRows[0] || null;
   if (!dash) return false;
   if (dash.user_id === userId) return true;
   if (dash.is_public) return true;
-  const { data: share } = await supabaseServer
-    .from('ai_dashboard_shares')
-    .select('id')
-    .eq('dashboard_id', dashboardId)
-    .eq('shared_with_user_id', userId)
-    .maybeSingle();
-  return !!share;
+  const { rows: shareRows } = await pool.query(
+    'SELECT id FROM ai_dashboard_shares WHERE dashboard_id = $1 AND shared_with_user_id = $2 LIMIT 1',
+    [dashboardId, userId],
+  );
+  return shareRows.length > 0;
 }
 
 export async function getDashboard(userId, id) {
   if (!(await dashboardReadable(userId, id))) return null;
-  const { data, error } = await supabaseServer
-    .from('ai_dashboards')
-    .select('id, user_id, title, layout, widgets, thread_id, share_token, is_public, updated_at, created_at')
-    .eq('id', id)
-    .single();
-  if (error) throw new Error(error.message);
-  return data;
+  const { rows } = await pool.query(
+    'SELECT id, user_id, title, layout, widgets, thread_id, share_token, is_public, updated_at, created_at FROM ai_dashboards WHERE id = $1 LIMIT 1',
+    [id],
+  );
+  return rows[0] || null;
 }
 
 export async function updateDashboard(userId, id, body) {
-  const update = {};
-  if (typeof body.title === 'string') update.title = body.title;
-  if (body.layout) update.layout = body.layout;
-  if (Array.isArray(body.widgets)) update.widgets = body.widgets;
-  if (Object.keys(update).length === 0) throw new Error('no fields to update');
+  const setClauses = ['updated_at = $1'];
+  const params = [new Date().toISOString()];
+  let idx = 2;
 
-  const { data, error } = await supabaseServer
-    .from('ai_dashboards')
-    .update({ ...update, updated_at: new Date().toISOString() })
-    .eq('id', id)
-    .eq('user_id', userId)
-    .select('id, title, updated_at')
-    .single();
-  if (error) throw new Error(error.message);
-  return data;
+  if (typeof body.title === 'string') {
+    setClauses.push(`title = $${idx}`);
+    params.push(body.title);
+    idx++;
+  }
+  if (body.layout) {
+    setClauses.push(`layout = $${idx}`);
+    params.push(JSON.stringify(body.layout));
+    idx++;
+  }
+  if (Array.isArray(body.widgets)) {
+    setClauses.push(`widgets = $${idx}`);
+    params.push(JSON.stringify(body.widgets));
+    idx++;
+  }
+
+  if (setClauses.length === 1) throw new Error('no fields to update');
+
+  params.push(id, userId);
+  const { rows } = await pool.query(
+    `UPDATE ai_dashboards SET ${setClauses.join(', ')} WHERE id = $${idx} AND user_id = $${idx + 1} RETURNING id, title, updated_at`,
+    params,
+  );
+  return rows[0];
 }
 
 export async function deleteDashboard(userId, id) {
-  const { error } = await supabaseServer
-    .from('ai_dashboards')
-    .delete()
-    .eq('id', id)
-    .eq('user_id', userId);
-  if (error) throw new Error(error.message);
+  await pool.query(
+    'DELETE FROM ai_dashboards WHERE id = $1 AND user_id = $2',
+    [id, userId],
+  );
   return { ok: true };
 }

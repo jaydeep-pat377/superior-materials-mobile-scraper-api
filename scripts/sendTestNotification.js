@@ -5,22 +5,20 @@
  */
 
 require('dotenv').config();
-const { getSupabase, getSupabaseAdmin } = require('../src/config/database');
+const { getPool } = require('../src/config/database');
 const notificationService = require('../src/services/notificationService');
 const deviceService = require('../src/services/deviceService');
 
 async function findUserByEmail(email) {
-  const supabaseAdmin = getSupabaseAdmin();
+  const pool = getPool();
 
-  // Get user from auth.users
-  const { data: authData, error: authError } = await supabaseAdmin.auth.admin.listUsers();
+  // Get user from public.users by email
+  const { rows } = await pool.query(
+    'SELECT id, email FROM users WHERE LOWER(email) = LOWER($1) LIMIT 1',
+    [email]
+  );
 
-  if (authError) {
-    throw new Error(`Error fetching users: ${authError.message}`);
-  }
-
-  const user = authData.users.find(u => u.email === email);
-  return user || null;
+  return rows[0] || null;
 }
 
 async function sendTestNotification(email, title, body) {
