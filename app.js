@@ -143,13 +143,13 @@ const path = require('path');
 // Serve apple-app-site-association without file extension
 app.get('/.well-known/apple-app-site-association', (req, res) => {
   res.set('Content-Type', 'application/json');
-  res.sendFile(path.join(__dirname, 'public', '.well-known', 'apple-app-site-association'));
+  res.sendFile(path.join(__dirname, 'public', '.well-known', 'apple-app-site-association'), { dotfiles: 'allow' });
 });
 
 // Serve Android assetlinks.json
 app.get('/.well-known/assetlinks.json', (req, res) => {
   res.set('Content-Type', 'application/json');
-  res.sendFile(path.join(__dirname, 'public', '.well-known', 'assetlinks.json'));
+  res.sendFile(path.join(__dirname, 'public', '.well-known', 'assetlinks.json'), { dotfiles: 'allow' });
 });
 
 // Serve public PDF documents (NRMCA CIP guides) for mobile clients

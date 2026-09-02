@@ -1,0 +1,118 @@
+# Separate mobile/API deployment for Dolese, running the migrated (PostgreSQL)
+# codebase in API mode (`node server.js`, NOT --worker). This is intentionally a
+# NEW deployment so the existing `dolese-cron` scraper is never disturbed.
+#
+# Env layering (later overrides earlier):
+#   1. envFrom dolese-cron-env   -> DATABASE_URL, PG pool, SMTP, S3, Sentry, etc.
+#   2. envFrom dolese-api-auth   -> JWT_SECRET, JWT_REFRESH_SECRET, ENCRYPTION_KEY
+#   3. inline env                -> deterministic PORT + CHAT_REALTIME_DISABLED
+#
+# The dolese-api-auth secret is created out-of-band (kubectl create secret) with
+# freshly generated values; it is NOT committed here.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dolese-api
+  namespace: dolese
+  labels:
+    app: dolese-api
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: dolese-api
+  template:
+    metadata:
+      labels:
+        app: dolese-api
+    spec:
+      containers:
+        - name: dolese-api
+          image: 739272173777.dkr.ecr.us-east-1.amazonaws.com/dolese-api:v10
+          imagePullPolicy: IfNotPresent
+          command: ["node", "server.js"]   # API mode only (no --worker)
+          ports:
+            - name: http
+              containerPort: 3000
+          envFrom:
+            - secretRef:
+                name: dolese-cron-env       # inherit DATABASE_URL & shared config
+            - secretRef:
+                name: dolese-api-auth        # auth signing keys (created separately)
+            - secretRef:
+                name: dolese-api-supabase-auth  # k8s Secret name — do not rename without
+                                                # updating the live Secret. Provides
+                                                # AUTH_DATABASE_URL / SERVICE_KEY for the
+                                                # shared central-auth (auth_tenant schema).
+          env:
+            - name: PORT
+              value: "3000"
+            - name: NODE_ENV
+              value: "production"
+            - name: CHAT_REALTIME_DISABLED   # conservative first rollout: no new push flow
+              value: "true"
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /live
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 768Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: dolese-api
+  namespace: dolese
+  labels:
+    app: dolese-api
+spec:
+  type: ClusterIP
+  selector:
+    app: dolese-api
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+---
+# Internet-facing ALB (AWS Load Balancer Controller) — mirrors dolese-frontend.
+# Once applied, this provisions a public URL:  dolese-api-<id>.us-east-1.elb.amazonaws.com
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: dolese-api
+  namespace: dolese
+  labels:
+    app: dolese-api
+  annotations:
+    alb.ingress.kubernetes.io/scheme: internet-facing
+    alb.ingress.kubernetes.io/target-type: ip
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP":80}]'
+    alb.ingress.kubernetes.io/load-balancer-name: dolese-api
+    alb.ingress.kubernetes.io/healthcheck-protocol: HTTP
+    alb.ingress.kubernetes.io/healthcheck-path: /live
+    alb.ingress.kubernetes.io/target-group-attributes: deregistration_delay.timeout_seconds=30
+spec:
+  ingressClassName: alb
+  rules:
+    - http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: dolese-api
+                port:
+                  number: 80

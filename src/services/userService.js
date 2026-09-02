@@ -51,7 +51,11 @@ async function getUserEmailFromAuth(userId) {
 }
 
 /**
- * Create user profile in public.users table if it doesn't exist
+ * Create user profile in public.users table if it doesn't exist.
+ * Mobile auth uses central auth UUIDs that may not exist in the local
+ * auth.users table (managed by authgw). Since public.users.id FKs to
+ * auth.users.id, we ensure the auth.users row exists first.
+ *
  * @param {string} userId - User ID (UUID)
  * @param {string} email - User email
  * @returns {Object} Created or existing user profile data
@@ -72,6 +76,20 @@ async function createUserProfile(userId, email) {
     }
 
     const now = new Date().toISOString();
+
+    // Ensure auth.users row exists (FK target for public.users.id).
+    // Mobile-authenticated users come from the central auth DB and may
+    // not have a matching row in the local authgw auth.users table.
+    try {
+      await pool.query(
+        `INSERT INTO auth.users (id, email, role, created_at, updated_at)
+         VALUES ($1, $2, 'authenticated', $3, $3)
+         ON CONFLICT (id) DO NOTHING`,
+        [userId, email || null, now]
+      );
+    } catch (authInsertErr) {
+      console.warn('[UserService] auth.users ensure failed (non-fatal):', authInsertErr.message);
+    }
 
     try {
       const { rows } = await pool.query(

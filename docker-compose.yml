@@ -1,0 +1,28 @@
+# Local dev parity for the production image.
+# Verifies the same image runs as both API and worker before pushing to ECR.
+#
+#   docker compose up --build
+#   docker compose logs -f api worker
+
+services:
+  api:
+    build: .
+    image: truckast-api:local
+    ports:
+      # host:container — host port 8080 avoids Windows port-reservation issues with 5000.
+      # Inside the container the app still listens on $PORT (5000 from .env).
+      # Note: on Windows, browse via http://127.0.0.1:8080 (not localhost), because
+      # Chrome resolves `localhost` to ::1 first and Docker Desktop only binds IPv4.
+      - "8080:5000"
+    env_file: .env
+    # Local-only convenience: mount the Firebase JSON back into the container.
+    # The file is excluded from the production image via .dockerignore — in prod
+    # you set FIREBASE_SERVICE_ACCOUNT in env instead. This mount only affects
+    # local docker-compose runs.
+    volumes:
+      - ./src/config/truckast-app-firebase-adminsdk-fbsvc-9c40fa6a9f.json:/app/src/config/truckast-app-firebase-adminsdk-fbsvc-9c40fa6a9f.json:ro
+    restart: always
+
+# Worker service is intentionally not defined for now — focus is the mobile API only.
+# The worker task definition still lives at deploy/ecs/worker-task-definition.json
+# for when the queue processor needs to run in production.
