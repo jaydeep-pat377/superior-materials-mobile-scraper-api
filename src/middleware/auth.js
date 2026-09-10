@@ -363,6 +363,7 @@ async function getAllowedProjectCodesForUser(userId) {
 
 // Cache for central auth UUID → public.users UUID mapping (avoids repeated lookups)
 const _userIdMappingCache = new Map();
+const USER_ID_MAPPING_CACHE_TTL_MS = 30 * 60 * 1000; // 30 minutes
 
 /**
  * Resolve the effective user ID for role/access queries.
@@ -372,7 +373,7 @@ const _userIdMappingCache = new Map();
 async function resolveEffectiveUserId(userId, userEmail) {
   // Check mapping cache first (no TTL — mapping never changes)
   const cached = _userIdMappingCache.get(userId);
-  if (cached) return cached;
+  if (cached && (Date.now() - cached.ts) < USER_ID_MAPPING_CACHE_TTL_MS) return cached.value;
 
   // Single query: check if userId exists in user_roles OR user_customers, and also look up by email
   try {
@@ -389,14 +390,14 @@ async function resolveEffectiveUserId(userId, userEmail) {
 
       // If userId exists in roles/customers, use it directly
       if (row.id_exists) {
-        _userIdMappingCache.set(userId, userId);
+        _userIdMappingCache.set(userId, { value: userId, ts: Date.now() });
         return userId;
       }
 
       // Otherwise use the email-mapped UUID
       if (row.email_user_id && row.email_user_id !== userId) {
         console.log(`[AccessControl] Resolved user ID: ${userId} → ${row.email_user_id} (via email ${userEmail})`);
-        _userIdMappingCache.set(userId, row.email_user_id);
+        _userIdMappingCache.set(userId, { value: row.email_user_id, ts: Date.now() });
         return row.email_user_id;
       }
     }
@@ -405,7 +406,7 @@ async function resolveEffectiveUserId(userId, userEmail) {
   }
 
   // No mapping found — use the original userId
-  _userIdMappingCache.set(userId, userId);
+  _userIdMappingCache.set(userId, { value: userId, ts: Date.now() });
   return userId;
 }
 
