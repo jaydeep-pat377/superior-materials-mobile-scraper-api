@@ -6,7 +6,7 @@
  */
 
 const nodemailer = require('nodemailer');
-const { getSupabaseAdmin } = require('../config/database');
+const { getPool } = require('../config/database');
 
 // --- SMTP Config ---
 function createTransporter() {
@@ -110,17 +110,13 @@ function getOrderUrl(orderId) {
 
 async function getEmailTemplateByKey(templateKey) {
   try {
-    const supabase = getSupabaseAdmin();
-    const { data, error } = await supabase
-      .from('email_templates')
-      .select('*')
-      .eq('template_key', templateKey)
-      .eq('is_active', true)
-      .limit(1)
-      .single();
+    const pool = getPool();
+    const { rows } = await pool.query(
+      'SELECT * FROM email_templates WHERE template_key = $1 AND is_active = true LIMIT 1',
+      [templateKey]
+    );
 
-    if (error || !data) return null;
-    return data;
+    return rows[0] || null;
   } catch {
     return null;
   }

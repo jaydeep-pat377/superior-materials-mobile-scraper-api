@@ -1,36 +1,39 @@
 /** Per-widget comments on saved dashboards (ported from /api/ai/dashboards/[id]/comments). */
-import { supabaseServer } from './_supabase.mjs';
+import pool from './_db.mjs';
 
 async function canReadDashboard(userId, id) {
-  const { data: dash } = await supabaseServer
-    .from('ai_dashboards')
-    .select('user_id, is_public')
-    .eq('id', id)
-    .single();
+  const { rows: dashRows } = await pool.query(
+    'SELECT user_id, is_public FROM ai_dashboards WHERE id = $1',
+    [id],
+  );
+  const dash = dashRows[0];
   if (!dash) return false;
   if (dash.user_id === userId || dash.is_public) return true;
-  const { data: share } = await supabaseServer
-    .from('ai_dashboard_shares')
-    .select('id')
-    .eq('dashboard_id', id)
-    .eq('shared_with_user_id', userId)
-    .maybeSingle();
-  return !!share;
+  const { rows: shareRows } = await pool.query(
+    'SELECT id FROM ai_dashboard_shares WHERE dashboard_id = $1 AND shared_with_user_id = $2',
+    [id, userId],
+  );
+  return shareRows.length > 0;
 }
 
 export async function listComments(userId, id, widgetId) {
   if (!(await canReadDashboard(userId, id))) {
     throw Object.assign(new Error('Not found'), { status: 404 });
   }
-  let q = supabaseServer
-    .from('ai_widget_comments')
-    .select('id, widget_id, user_id, body, parent_id, created_at')
-    .eq('dashboard_id', id)
-    .order('created_at', { ascending: true });
-  if (widgetId) q = q.eq('widget_id', widgetId);
-  const { data, error } = await q;
-  if (error) throw Object.assign(new Error(error.message), { status: 500 });
-  return { comments: data ?? [] };
+  const params = [id];
+  let widgetClause = '';
+  if (widgetId) {
+    widgetClause = ' AND widget_id = $2';
+    params.push(widgetId);
+  }
+  const { rows } = await pool.query(
+    `SELECT id, widget_id, user_id, body, parent_id, created_at
+     FROM ai_widget_comments
+     WHERE dashboard_id = $1${widgetClause}
+     ORDER BY created_at ASC`,
+    params,
+  );
+  return { comments: rows };
 }
 
 export async function addComment(userId, id, { widgetId, body, parentId } = {}) {
@@ -41,42 +44,33 @@ export async function addComment(userId, id, { widgetId, body, parentId } = {}) 
     throw Object.assign(new Error('widgetId and body required'), { status: 400 });
   }
   if (body.length > 4000) throw Object.assign(new Error('body too long'), { status: 400 });
-  const { data, error } = await supabaseServer
-    .from('ai_widget_comments')
-    .insert({
-      dashboard_id: id,
-      widget_id: widgetId,
-      user_id: userId,
-      body,
-      parent_id: parentId ?? null,
-    })
-    .select('id, widget_id, user_id, body, parent_id, created_at')
-    .single();
-  if (error) throw Object.assign(new Error(error.message), { status: 500 });
-  return { comment: data };
+  const { rows } = await pool.query(
+    `INSERT INTO ai_widget_comments (dashboard_id, widget_id, user_id, body, parent_id)
+     VALUES ($1, $2, $3, $4, $5)
+     RETURNING id, widget_id, user_id, body, parent_id, created_at`,
+    [id, widgetId, userId, body, parentId ?? null],
+  );
+  return { comment: rows[0] };
 }
 
 export async function editComment(userId, commentId, body) {
   if (!body || body.length > 4000) {
     throw Object.assign(new Error('body required (≤4000 chars)'), { status: 400 });
   }
-  const { data, error } = await supabaseServer
-    .from('ai_widget_comments')
-    .update({ body })
-    .eq('id', commentId)
-    .eq('user_id', userId)
-    .select('id, body, updated_at')
-    .single();
-  if (error) throw Object.assign(new Error(error.message), { status: 500 });
-  return { comment: data };
+  const { rows } = await pool.query(
+    `UPDATE ai_widget_comments
+     SET body = $1
+     WHERE id = $2 AND user_id = $3
+     RETURNING id, body, updated_at`,
+    [body, commentId, userId],
+  );
+  return { comment: rows[0] };
 }
 
 export async function deleteComment(userId, commentId) {
-  const { error } = await supabaseServer
-    .from('ai_widget_comments')
-    .delete()
-    .eq('id', commentId)
-    .eq('user_id', userId);
-  if (error) throw Object.assign(new Error(error.message), { status: 500 });
+  await pool.query(
+    'DELETE FROM ai_widget_comments WHERE id = $1 AND user_id = $2',
+    [commentId, userId],
+  );
   return { ok: true };
 }

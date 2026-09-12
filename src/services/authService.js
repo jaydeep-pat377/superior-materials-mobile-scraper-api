@@ -1,10 +1,12 @@
-const { getSupabase, getSupabaseAdmin } = require('../config/database');
+const { getPool } = require('../config/database');
+const { getAuthPool } = require('../config/authDatabase');
 const { generateAccessToken, generateRefreshToken, verifyAccessToken, verifyRefreshToken } = require('../utils/jwtUtils');
+const { verifyPassword, hashPassword } = require('../utils/encryptionUtils');
 const deviceService = require('./deviceService');
 const { loadUserAccessData } = require('../middleware/auth');
 
 /**
- * Login with email and password using Supabase Auth
+ * Login with email and password using bcrypt verification against auth_tenant.users
  * @param {string} email - User email
  * @param {string} password - User password
  * @param {Object} deviceInfo - Optional device information
@@ -12,8 +14,8 @@ const { loadUserAccessData } = require('../middleware/auth');
  */
 async function loginWithEmail(email, password, deviceInfo = null) {
   try {
-    const supabase = getSupabase();
-    const supabaseAdmin = getSupabaseAdmin();
+    const pool = getPool();
+    const authPool = getAuthPool();
     const normalizedEmail = email.toLowerCase().trim();
 
     // ---------------------------------------------------------------
@@ -21,11 +23,10 @@ async function loginWithEmail(email, password, deviceInfo = null) {
     // ---------------------------------------------------------------
 
     // Check if user is still in signup_pending (incomplete signup)
-    const { data: pendingSignup } = await supabaseAdmin
-      .from('signup_pending')
-      .select('email_verified, phone_number, phone_country_code')
-      .eq('email', normalizedEmail)
-      .limit(1);
+    const { rows: pendingSignup } = await pool.query(
+      'SELECT email_verified, phone_number, phone_country_code FROM signup_pending WHERE email = $1 LIMIT 1',
+      [normalizedEmail]
+    );
 
     if (pendingSignup && pendingSignup.length > 0) {
       const pending = pendingSignup[0];
@@ -35,55 +36,65 @@ async function loginWithEmail(email, password, deviceInfo = null) {
       if (!pending.phone_number || !pending.phone_country_code) {
         throw new Error('Phone number not verified. Please complete phone verification first.');
       }
-      // If pending record exists with email verified but still in table → phone not verified
+      // If pending record exists with email verified but still in table -> phone not verified
       throw new Error('Phone number not verified. Please complete phone verification first.');
     }
 
     // Check if user exists in database
-    const { data: userProfile } = await supabaseAdmin
-      .from('users')
-      .select('active, user_type')
-      .eq('email', normalizedEmail)
-      .limit(1);
+    const { rows: userProfile } = await pool.query(
+      'SELECT active, user_type FROM users WHERE email = $1 LIMIT 1',
+      [normalizedEmail]
+    );
 
     if (!userProfile || userProfile.length === 0) {
       throw new Error('User not found');
     }
 
-    // Check admin approval — ONLY for QR signup users
+    // Check admin approval -- ONLY for QR signup users
     const profile = userProfile[0];
     if (profile.user_type === 'QR' && !profile.active) {
       throw new Error('Your account is pending admin approval. You will be notified via email or phone once approved.');
     }
 
     // ---------------------------------------------------------------
-    // Authenticate with Supabase Auth
+    // Authenticate with bcrypt against auth_tenant.users
     // ---------------------------------------------------------------
-    const { data, error } = await supabase.auth.signInWithPassword({
-      email: normalizedEmail,
-      password
-    });
+    const { rows: authUsers } = await authPool.query(
+      `SELECT id, uuid, email, phone_number, password_hash, full_name, active
+       FROM auth_tenant.users
+       WHERE email = $1 AND deleted_at IS NULL
+       LIMIT 1`,
+      [normalizedEmail]
+    );
 
-    if (error) {
-      throw new Error(error.message || 'Invalid email or password');
+    if (!authUsers || authUsers.length === 0) {
+      throw new Error('Invalid email or password');
     }
 
-    if (!data.user) {
-      throw new Error('Authentication failed');
+    const authUser = authUsers[0];
+
+    const passwordValid = await verifyPassword(password, authUser.password_hash);
+    if (!passwordValid) {
+      throw new Error('Invalid email or password');
     }
+
+    // Use the user's UUID as the ID (consistent with existing login behavior)
+    const userId = authUser.uuid;
 
     // Load user access data to determine userType (admin, producer, contractor, none)
-    const accessData = await loadUserAccessData(data.user.id);
+    const accessData = await loadUserAccessData(userId);
 
     // Get user metadata
     const user = {
-      id: data.user.id,
-      email: data.user.email,
-      phone: data.user.phone,
-      role: data.user.role || 'user',
+      id: userId,
+      email: authUser.email,
+      phone: authUser.phone_number || '',
+      role: 'authenticated',
       userType: accessData.userType || 'none',
       userRole: accessData.userRole || null,
-      metadata: data.user.user_metadata
+      metadata: {
+        full_name: authUser.full_name
+      }
     };
 
     // Register/update device if device info is provided
@@ -103,8 +114,7 @@ async function loginWithEmail(email, password, deviceInfo = null) {
     return {
       user,
       accessToken,
-      refreshToken,
-      session: data.session
+      refreshToken
     };
   } catch (error) {
     throw error;
@@ -112,7 +122,7 @@ async function loginWithEmail(email, password, deviceInfo = null) {
 }
 
 /**
- * Login with phone and password using Supabase Auth
+ * Login with phone and password using bcrypt verification against auth_tenant.users
  * @param {string} phone - User phone number
  * @param {string} password - User password
  * @param {Object} deviceInfo - Optional device information
@@ -120,57 +130,72 @@ async function loginWithEmail(email, password, deviceInfo = null) {
  */
 async function loginWithPhone(phone, password, deviceInfo = null) {
   try {
-    const supabase = getSupabase();
-    const supabaseAdmin = getSupabaseAdmin();
+    const pool = getPool();
+    const authPool = getAuthPool();
 
     // ---------------------------------------------------------------
+    // Authenticate with bcrypt against auth_tenant.users by phone
+    // ---------------------------------------------------------------
+    const { rows: authUsers } = await authPool.query(
+      `SELECT id, uuid, email, phone_number, phone_country_code, password_hash, full_name, active
+       FROM auth_tenant.users
+       WHERE phone_number = $1 AND deleted_at IS NULL
+       LIMIT 1`,
+      [phone]
+    );
+
+    // If not found by phone_number alone, try matching with country code prefix
+    let authUser = authUsers && authUsers.length > 0 ? authUsers[0] : null;
+
+    if (!authUser) {
+      // Try matching phone with country code concatenation
+      const { rows: authUsers2 } = await authPool.query(
+        `SELECT id, uuid, email, phone_number, phone_country_code, password_hash, full_name, active
+         FROM auth_tenant.users
+         WHERE CONCAT(phone_country_code, phone_number) = $1 AND deleted_at IS NULL
+         LIMIT 1`,
+        [phone]
+      );
+      authUser = authUsers2 && authUsers2.length > 0 ? authUsers2[0] : null;
+    }
+
+    if (!authUser) {
+      throw new Error('Invalid phone number or password');
+    }
+
+    const passwordValid = await verifyPassword(password, authUser.password_hash);
+    if (!passwordValid) {
+      throw new Error('Invalid phone number or password');
+    }
+
     // Pre-auth check: block users pending admin approval
-    // Look up email from auth user by phone, then check public.users.active
-    // ---------------------------------------------------------------
-    const { data: authUsers } = await supabaseAdmin.auth.admin.listUsers({ page: 1, perPage: 1000 });
-    if (authUsers?.users) {
-      const matchedAuth = authUsers.users.find(u => u.phone === phone);
-      if (matchedAuth?.email) {
-        const { data: userProfile } = await supabaseAdmin
-          .from('users')
-          .select('active')
-          .eq('email', matchedAuth.email.toLowerCase())
-          .limit(1);
+    if (authUser.email) {
+      const { rows: userProfile } = await pool.query(
+        'SELECT active FROM users WHERE email = $1 LIMIT 1',
+        [authUser.email.toLowerCase()]
+      );
 
-        if (userProfile && userProfile.length > 0 && !userProfile[0].active) {
-          throw new Error('Your account is pending admin approval. You will be notified via email or phone once approved.');
-        }
+      if (userProfile && userProfile.length > 0 && !userProfile[0].active) {
+        throw new Error('Your account is pending admin approval. You will be notified via email or phone once approved.');
       }
     }
 
-    // ---------------------------------------------------------------
-    // Authenticate with Supabase Auth using phone
-    // ---------------------------------------------------------------
-    const { data, error } = await supabase.auth.signInWithPassword({
-      phone,
-      password
-    });
-
-    if (error) {
-      throw new Error(error.message || 'Invalid phone number or password');
-    }
-
-    if (!data.user) {
-      throw new Error('Authentication failed');
-    }
+    const userId = authUser.uuid;
 
     // Load user access data to determine userType (admin, producer, contractor, none)
-    const accessData = await loadUserAccessData(data.user.id);
+    const accessData = await loadUserAccessData(userId);
 
     // Get user metadata
     const user = {
-      id: data.user.id,
-      email: data.user.email,
-      phone: data.user.phone,
-      role: data.user.role || 'user',
+      id: userId,
+      email: authUser.email,
+      phone: authUser.phone_number || '',
+      role: 'authenticated',
       userType: accessData.userType || 'none',
       userRole: accessData.userRole || null,
-      metadata: data.user.user_metadata
+      metadata: {
+        full_name: authUser.full_name
+      }
     };
 
     // Register/update device if device info is provided
@@ -189,8 +214,7 @@ async function loginWithPhone(phone, password, deviceInfo = null) {
     return {
       user,
       accessToken,
-      refreshToken,
-      session: data.session
+      refreshToken
     };
   } catch (error) {
     throw error;
@@ -198,7 +222,7 @@ async function loginWithPhone(phone, password, deviceInfo = null) {
 }
 
 /**
- * Logout user - invalidate session and deactivate device token
+ * Logout user - deactivate device token
  * @param {string} userId - User ID
  * @param {string} accessToken - Access token to invalidate
  * @param {string} deviceToken - Optional device token to deactivate
@@ -206,29 +230,19 @@ async function loginWithPhone(phone, password, deviceInfo = null) {
  */
 async function logout(userId, accessToken, deviceToken = null) {
   try {
-    const supabase = getSupabase();
-    
     // Deactivate device token if provided
     if (deviceToken) {
       try {
         await deviceService.deactivateDeviceToken(deviceToken);
       } catch (deviceError) {
-        // Log device deactivation error but don't fail logout
-        console.error('⚠️  Device token deactivation failed during logout:', deviceError.message);
+        console.error('Device token deactivation failed during logout:', deviceError.message);
       }
-    }
-    
-    // Sign out from Supabase Auth
-    const { error } = await supabase.auth.signOut();
-
-    if (error) {
-      throw new Error(error.message || 'Logout failed');
     }
 
     // In a production system, you might want to:
     // 1. Store blacklisted tokens in Redis/database
     // 2. Invalidate refresh tokens
-    // For now, we'll rely on token expiration
+    // For now, we rely on token expiration
 
     return true;
   } catch (error) {
@@ -273,24 +287,38 @@ async function refreshToken(refreshToken) {
 }
 
 /**
- * Get current user from Supabase session
+ * Get current user from auth_tenant.users by UUID
+ * @param {string} userId - User UUID
  * @returns {Object} User data
  */
-async function getCurrentUser() {
+async function getCurrentUser(userId) {
   try {
-    const supabase = getSupabase();
-    const { data: { user }, error } = await supabase.auth.getUser();
-
-    if (error || !user) {
+    if (!userId) {
       throw new Error('User not found or session expired');
     }
 
+    const authPool = getAuthPool();
+    const { rows } = await authPool.query(
+      `SELECT id, uuid, email, phone_number, full_name, user_role, created_at
+       FROM auth_tenant.users
+       WHERE uuid = $1 AND deleted_at IS NULL
+       LIMIT 1`,
+      [userId]
+    );
+
+    if (!rows || rows.length === 0) {
+      throw new Error('User not found or session expired');
+    }
+
+    const user = rows[0];
     return {
-      id: user.id,
+      id: user.uuid,
       email: user.email,
-      phone: user.phone,
-      role: user.role || 'user',
-      metadata: user.user_metadata,
+      phone: user.phone_number || '',
+      role: user.user_role || 'user',
+      metadata: {
+        full_name: user.full_name
+      },
       createdAt: user.created_at
     };
   } catch (error) {
@@ -309,7 +337,7 @@ function verifyToken(token) {
 
 /**
  * Change user password
- * @param {string} userId - User ID
+ * @param {string} userId - User UUID
  * @param {string} userEmail - User email
  * @param {string} currentPassword - Current password
  * @param {string} newPassword - New password
@@ -345,14 +373,29 @@ async function changePassword(userId, userEmail, currentPassword, newPassword, c
       };
     }
 
-    // Step 1: Verify current password by attempting to sign in
-    const supabase = getSupabase();
-    const { data: signInData, error: signInError } = await supabase.auth.signInWithPassword({
-      email: userEmail,
-      password: currentPassword
-    });
+    // Step 1: Verify current password against auth_tenant.users
+    const authPool = getAuthPool();
+    const normalizedEmail = userEmail.toLowerCase().trim();
 
-    if (signInError || !signInData.user) {
+    const { rows } = await authPool.query(
+      `SELECT id, uuid, password_hash FROM auth_tenant.users
+       WHERE email = $1 AND deleted_at IS NULL
+       LIMIT 1`,
+      [normalizedEmail]
+    );
+
+    if (!rows || rows.length === 0) {
+      return {
+        success: false,
+        error: 'User not found',
+        code: 'USER_NOT_FOUND'
+      };
+    }
+
+    const authUser = rows[0];
+    const passwordValid = await verifyPassword(currentPassword, authUser.password_hash);
+
+    if (!passwordValid) {
       return {
         success: false,
         error: 'Current password is incorrect',
@@ -360,15 +403,17 @@ async function changePassword(userId, userEmail, currentPassword, newPassword, c
       };
     }
 
-    // Step 2: Update password using Supabase Admin API
-    const supabaseAdmin = getSupabaseAdmin();
-    const { data: updateData, error: updateError } = await supabaseAdmin.auth.admin.updateUserById(
-      userId,
-      { password: newPassword }
+    // Step 2: Update password in auth_tenant.users
+    const newHash = await hashPassword(newPassword);
+    const { rowCount } = await authPool.query(
+      `UPDATE auth_tenant.users
+       SET password_hash = $1, updated_at = $2
+       WHERE id = $3`,
+      [newHash, new Date().toISOString(), authUser.id]
     );
 
-    if (updateError) {
-      console.error('Error updating password:', updateError.message);
+    if (rowCount === 0) {
+      console.error('Error updating password: no rows updated');
       return {
         success: false,
         error: 'Failed to update password. Please try again.',
@@ -399,5 +444,3 @@ module.exports = {
   verifyToken,
   changePassword
 };
-
-

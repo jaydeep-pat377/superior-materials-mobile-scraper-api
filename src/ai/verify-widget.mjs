@@ -7,7 +7,7 @@
  */
 
 import { createHash } from 'node:crypto';
-import { supabaseServer } from './_supabase.mjs';
+import pool from './_db.mjs';
 import { executeAggregate, executeCount } from './query-executor.mjs';
 import { resolveRelativeDateRange } from './date-resolver.mjs';
 
@@ -38,11 +38,13 @@ async function loadOrComputeBaseline(body) {
   if (body.method === 'avg') return null;
 
   const key = metricKey(body);
-  const { data: cached } = await supabaseServer
-    .from('ai_metric_baselines')
-    .select('baseline_mean, baseline_stddev, sample_size, computed_at')
-    .eq('metric_key', key)
-    .maybeSingle();
+  const { rows: baselineRows } = await pool.query(
+    `SELECT baseline_mean, baseline_stddev, sample_size, computed_at
+     FROM ai_metric_baselines
+     WHERE metric_key = $1`,
+    [key],
+  );
+  const cached = baselineRows[0] || null;
 
   if (cached) {
     const ageHours = (Date.now() - new Date(cached.computed_at).getTime()) / 3.6e6;
@@ -94,19 +96,30 @@ async function loadOrComputeBaseline(body) {
     values.reduce((acc, v) => acc + Math.pow(v - mean, 2), 0) / values.length;
   const stddev = Math.sqrt(variance);
 
-  await supabaseServer.from('ai_metric_baselines').upsert(
-    {
-      metric_key: key,
-      table_name: body.table,
-      group_by: body.groupBy ?? null,
-      method: body.method,
-      value_col: body.valueColumn ?? null,
-      baseline_mean: mean,
-      baseline_stddev: stddev,
-      sample_size: values.length,
-      computed_at: new Date().toISOString(),
-    },
-    { onConflict: 'metric_key' },
+  await pool.query(
+    `INSERT INTO ai_metric_baselines
+       (metric_key, table_name, group_by, method, value_col, baseline_mean, baseline_stddev, sample_size, computed_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+     ON CONFLICT (metric_key) DO UPDATE SET
+       table_name = EXCLUDED.table_name,
+       group_by = EXCLUDED.group_by,
+       method = EXCLUDED.method,
+       value_col = EXCLUDED.value_col,
+       baseline_mean = EXCLUDED.baseline_mean,
+       baseline_stddev = EXCLUDED.baseline_stddev,
+       sample_size = EXCLUDED.sample_size,
+       computed_at = EXCLUDED.computed_at`,
+    [
+      key,
+      body.table,
+      body.groupBy ?? null,
+      body.method,
+      body.valueColumn ?? null,
+      mean,
+      stddev,
+      values.length,
+      new Date().toISOString(),
+    ],
   );
 
   return { mean, stddev, sampleSize: values.length };

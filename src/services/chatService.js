@@ -1,4 +1,4 @@
-const { getSupabaseAdmin } = require('../config/database');
+const { getPool } = require('../config/database');
 const deviceService = require('./deviceService');
 const { getMessaging } = require('../config/Firebase');
 
@@ -6,19 +6,19 @@ const { getMessaging } = require('../config/Firebase');
  * Get read status (last_read_at) for all orders the user has read
  */
 async function getReadStatus(userId) {
-  const supabase = getSupabaseAdmin();
+  const pool = getPool();
 
-  const { data, error } = await supabase
-    .from('chat_read_status')
-    .select('order_id, last_read_at')
-    .eq('user_id', userId);
+  try {
+    const { rows } = await pool.query(
+      'SELECT order_id, last_read_at FROM chat_read_status WHERE user_id = $1',
+      [userId]
+    );
 
-  if (error) {
+    return rows || [];
+  } catch (error) {
     console.error('[ChatService] getReadStatus error:', error.message);
     return [];
   }
-
-  return data || [];
 }
 
 /**
@@ -26,7 +26,7 @@ async function getReadStatus(userId) {
  * Compares chat_messages.created_at against chat_read_status.last_read_at.
  */
 async function getUnreadCounts(userId, orderIds) {
-  const supabase = getSupabaseAdmin();
+  const pool = getPool();
 
   // Get user's read statuses
   const readStatuses = await getReadStatus(userId);
@@ -38,40 +38,41 @@ async function getUnreadCounts(userId, orderIds) {
   // Build per-order unread counts
   const counts = {};
 
-  // If specific orderIds provided, filter to those; otherwise get all
-  let query = supabase
-    .from('chat_messages')
-    .select('order_id, created_at')
-    .eq('is_deleted', false)
-    .neq('sender_id', userId)
-    .order('created_at', { ascending: false });
+  try {
+    // If specific orderIds provided, filter to those; otherwise get all
+    let sql = 'SELECT order_id, created_at FROM chat_messages WHERE is_deleted = false AND sender_id != $1';
+    const params = [userId];
+    let idx = 2;
 
-  if (orderIds && orderIds.length > 0) {
-    query = query.in('order_id', orderIds);
-  }
+    if (orderIds && orderIds.length > 0) {
+      sql += ` AND order_id = ANY($${idx})`;
+      params.push(orderIds);
+      idx++;
+    }
 
-  const { data: messages, error } = await query;
+    sql += ' ORDER BY created_at DESC';
 
-  if (error) {
+    const { rows: messages } = await pool.query(sql, params);
+
+    let totalUnread = 0;
+
+    (messages || []).forEach(msg => {
+      const lastRead = readMap[msg.order_id];
+      // If no read status or message is newer than last read, it's unread
+      if (!lastRead || new Date(msg.created_at) > new Date(lastRead)) {
+        counts[msg.order_id] = (counts[msg.order_id] || 0) + 1;
+        totalUnread++;
+      }
+    });
+
+    return {
+      counts,
+      total_unread: totalUnread,
+    };
+  } catch (error) {
     console.error('[ChatService] getUnreadCounts error:', error.message);
     return { counts: {}, total_unread: 0 };
   }
-
-  let totalUnread = 0;
-
-  (messages || []).forEach(msg => {
-    const lastRead = readMap[msg.order_id];
-    // If no read status or message is newer than last read, it's unread
-    if (!lastRead || new Date(msg.created_at) > new Date(lastRead)) {
-      counts[msg.order_id] = (counts[msg.order_id] || 0) + 1;
-      totalUnread++;
-    }
-  });
-
-  return {
-    counts,
-    total_unread: totalUnread,
-  };
 }
 
 /**
@@ -79,30 +80,24 @@ async function getUnreadCounts(userId, orderIds) {
  * Upserts into chat_read_status with current timestamp.
  */
 async function markAsRead(userId, orderId) {
-  const supabase = getSupabaseAdmin();
+  const pool = getPool();
 
   // Add 2-second buffer to catch in-flight messages
   const lastReadAt = new Date(Date.now() + 2000).toISOString();
 
-  const { data, error } = await supabase
-    .from('chat_read_status')
-    .upsert(
-      {
-        user_id: userId,
-        order_id: orderId,
-        last_read_at: lastReadAt,
-      },
-      { onConflict: 'user_id,order_id' }
-    )
-    .select()
-    .single();
+  const { rows } = await pool.query(
+    `INSERT INTO chat_read_status (user_id, order_id, last_read_at)
+     VALUES ($1, $2, $3)
+     ON CONFLICT (user_id, order_id) DO UPDATE SET last_read_at = $3
+     RETURNING *`,
+    [userId, orderId, lastReadAt]
+  );
 
-  if (error) {
-    console.error('[ChatService] markAsRead error:', error.message);
-    throw new Error(`Failed to mark as read: ${error.message}`);
+  if (rows.length === 0) {
+    throw new Error('Failed to mark as read');
   }
 
-  return data;
+  return rows[0];
 }
 
 function truncate(text, max = 120) {

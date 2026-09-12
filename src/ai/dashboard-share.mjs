@@ -1,32 +1,34 @@
 /** Dashboard sharing: per-user grants + public links (ported from /api/ai/dashboards/[id]/share + public/[token]). */
 import { randomBytes } from 'node:crypto';
-import { supabaseServer } from './_supabase.mjs';
+import pool from './_db.mjs';
 
 async function ownsDashboard(userId, id) {
-  const { data } = await supabaseServer
-    .from('ai_dashboards')
-    .select('id')
-    .eq('id', id)
-    .eq('user_id', userId)
-    .maybeSingle();
-  return !!data;
+  const { rows } = await pool.query(
+    'SELECT id FROM ai_dashboards WHERE id = $1 AND user_id = $2',
+    [id, userId],
+  );
+  return rows.length > 0;
 }
 
 export async function getShareInfo(userId, id) {
   if (!(await ownsDashboard(userId, id))) {
     throw Object.assign(new Error('Not found'), { status: 404 });
   }
-  const [shares, dash] = await Promise.all([
-    supabaseServer
-      .from('ai_dashboard_shares')
-      .select('id, shared_with_user_id, permission, created_at')
-      .eq('dashboard_id', id),
-    supabaseServer.from('ai_dashboards').select('share_token, is_public').eq('id', id).single(),
+  const [sharesRes, dashRes] = await Promise.all([
+    pool.query(
+      'SELECT id, shared_with_user_id, permission, created_at FROM ai_dashboard_shares WHERE dashboard_id = $1',
+      [id],
+    ),
+    pool.query(
+      'SELECT share_token, is_public FROM ai_dashboards WHERE id = $1',
+      [id],
+    ),
   ]);
+  const dash = dashRes.rows[0];
   return {
-    shares: shares.data ?? [],
-    publicToken: dash.data?.share_token ?? null,
-    isPublic: dash.data?.is_public ?? false,
+    shares: sharesRes.rows,
+    publicToken: dash?.share_token ?? null,
+    isPublic: dash?.is_public ?? false,
   };
 }
 
@@ -38,36 +40,36 @@ export async function applyShare(userId, id, body = {}) {
     if (!body.email || !body.email.includes('@')) {
       throw Object.assign(new Error('valid email required'), { status: 400 });
     }
-    const { data: target, error: lookupErr } = await supabaseServer.auth.admin.listUsers({
-      page: 1,
-      perPage: 1000,
-    });
-    if (lookupErr) throw Object.assign(new Error(lookupErr.message), { status: 500 });
-    const found = target.users.find((u) => u.email?.toLowerCase() === body.email.toLowerCase());
+    const { rows: users } = await pool.query(
+      'SELECT id, email FROM auth.users',
+    );
+    const found = users.find((u) => u.email?.toLowerCase() === body.email.toLowerCase());
     if (!found) throw Object.assign(new Error('user not found'), { status: 404 });
-    const { error } = await supabaseServer
-      .from('ai_dashboard_shares')
-      .insert({ dashboard_id: id, shared_with_user_id: found.id, created_by: userId });
-    if (error && !/duplicate/i.test(error.message)) {
-      throw Object.assign(new Error(error.message), { status: 500 });
+    try {
+      await pool.query(
+        'INSERT INTO ai_dashboard_shares (dashboard_id, shared_with_user_id, created_by) VALUES ($1, $2, $3)',
+        [id, found.id, userId],
+      );
+    } catch (err) {
+      if (!/duplicate/i.test(err.message)) {
+        throw Object.assign(new Error(err.message), { status: 500 });
+      }
     }
     return { ok: true, sharedWithUserId: found.id };
   }
   if (body.action === 'generateLink') {
     const token = randomBytes(24).toString('base64url');
-    const { error } = await supabaseServer
-      .from('ai_dashboards')
-      .update({ share_token: token, is_public: true })
-      .eq('id', id);
-    if (error) throw Object.assign(new Error(error.message), { status: 500 });
+    await pool.query(
+      'UPDATE ai_dashboards SET share_token = $1, is_public = true WHERE id = $2',
+      [token, id],
+    );
     return { token, isPublic: true };
   }
   if (body.action === 'revokeLink') {
-    const { error } = await supabaseServer
-      .from('ai_dashboards')
-      .update({ share_token: null, is_public: false })
-      .eq('id', id);
-    if (error) throw Object.assign(new Error(error.message), { status: 500 });
+    await pool.query(
+      'UPDATE ai_dashboards SET share_token = NULL, is_public = false WHERE id = $1',
+      [id],
+    );
     return { ok: true };
   }
   throw Object.assign(new Error('unknown action'), { status: 400 });
@@ -80,23 +82,21 @@ export async function revokeUserShare(userId, id, sharedWithUserId) {
   if (!sharedWithUserId) {
     throw Object.assign(new Error('sharedWithUserId required'), { status: 400 });
   }
-  const { error } = await supabaseServer
-    .from('ai_dashboard_shares')
-    .delete()
-    .eq('dashboard_id', id)
-    .eq('shared_with_user_id', sharedWithUserId);
-  if (error) throw Object.assign(new Error(error.message), { status: 500 });
+  await pool.query(
+    'DELETE FROM ai_dashboard_shares WHERE dashboard_id = $1 AND shared_with_user_id = $2',
+    [id, sharedWithUserId],
+  );
   return { ok: true };
 }
 
 export async function getPublicDashboard(token) {
   if (!token) throw Object.assign(new Error('Not found'), { status: 404 });
-  const { data, error } = await supabaseServer
-    .from('ai_dashboards')
-    .select('id, title, layout, widgets, updated_at')
-    .eq('share_token', token)
-    .eq('is_public', true)
-    .single();
-  if (error || !data) throw Object.assign(new Error('Not found'), { status: 404 });
-  return { dashboard: data };
+  const { rows } = await pool.query(
+    `SELECT id, title, layout, widgets, updated_at
+     FROM ai_dashboards
+     WHERE share_token = $1 AND is_public = true`,
+    [token],
+  );
+  if (rows.length === 0) throw Object.assign(new Error('Not found'), { status: 404 });
+  return { dashboard: rows[0] };
 }

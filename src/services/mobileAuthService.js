@@ -8,8 +8,8 @@
  * 4. Exchange code for user information
  */
 
-const { getAuthSupabaseAdmin } = require('../config/authDatabase');
-const { getSupabaseAdmin } = require('../config/database');
+const { getAuthPool } = require('../config/authDatabase');
+const { getPool } = require('../config/database');
 const { createAuthCode, consumeAuthCode, CODE_EXPIRY_SECONDS } = require('./authCodeService');
 const { verifyPassword, secureCompare, decryptTenantSecret } = require('../utils/encryptionUtils');
 const { generateAccessToken, generateRefreshToken } = require('../utils/jwtUtils');
@@ -63,8 +63,8 @@ const ERROR_MESSAGES = {
  *
  * `auth_tenant.tenants.client_secret` is stored AES-256-GCM encrypted. This is the
  * exact value the central federated login (`/api/federated-auth/login`) hands back
- * to the client (decrypted), so validating the incoming secret against it — rather
- * than against a hardcoded copy — keeps login and exchange-code in lockstep even
+ * to the client (decrypted), so validating the incoming secret against it -- rather
+ * than against a hardcoded copy -- keeps login and exchange-code in lockstep even
  * when a tenant's secret is rotated.
  *
  * @param {Object} tenant - Tenant row containing the encrypted `client_secret` column
@@ -86,28 +86,21 @@ function resolveTenantClientSecret(tenant) {
  * @returns {Object|null} User record
  */
 async function getUserByEmail(email) {
-  const supabase = getAuthSupabaseAdmin();
+  const authPool = getAuthPool();
   const normalizedEmail = email.toLowerCase().trim();
 
-  // Use .schema('auth_tenant') to explicitly specify the schema
-  const { data, error } = await supabase
-    .schema('auth_tenant')
-    .from('users')
-    .select('*')
-    .eq('email', normalizedEmail)
-    .is('deleted_at', null)
-    .limit(1);
+  const { rows } = await authPool.query(
+    `SELECT * FROM auth_tenant.users
+     WHERE email = $1 AND deleted_at IS NULL
+     LIMIT 1`,
+    [normalizedEmail]
+  );
 
-  if (error) {
+  if (!rows || rows.length === 0) {
     return null;
   }
 
-  if (!data || data.length === 0) {
-    return null;
-  }
-
-  const user = data[0];
-  return user;
+  return rows[0];
 }
 
 /**
@@ -116,21 +109,16 @@ async function getUserByEmail(email) {
  * @returns {Object|null} User record
  */
 async function getUserById(userId) {
-  const supabase = getAuthSupabaseAdmin();
+  const authPool = getAuthPool();
 
-  const { data, error } = await supabase
-    .schema('auth_tenant')
-    .from('users')
-    .select('*')
-    .eq('id', userId)
-    .is('deleted_at', null)
-    .limit(1);
+  const { rows } = await authPool.query(
+    `SELECT * FROM auth_tenant.users
+     WHERE id = $1 AND deleted_at IS NULL
+     LIMIT 1`,
+    [userId]
+  );
 
-  if (error) {
-    return null;
-  }
-
-  return data && data.length > 0 ? data[0] : null;
+  return rows && rows.length > 0 ? rows[0] : null;
 }
 
 /**
@@ -140,26 +128,22 @@ async function getUserById(userId) {
  * @returns {Object|null} Tenant user record with tenant details
  */
 async function getTenantUser(userId, tenantId = null) {
-  const supabase = getAuthSupabaseAdmin();
+  const authPool = getAuthPool();
 
-  let query = supabase
-    .schema('auth_tenant')
-    .from('tenant_users')
-    .select('*')
-    .eq('user_id', userId)
-    .eq('status', 'active');
+  let sql = `SELECT * FROM auth_tenant.tenant_users
+             WHERE user_id = $1 AND status = 'active'`;
+  const params = [userId];
 
   if (tenantId) {
-    query = query.eq('tenant_id', tenantId);
+    sql += ` AND tenant_id = $${params.length + 1}`;
+    params.push(tenantId);
   }
 
-  const { data, error } = await query.limit(1);
+  sql += ' LIMIT 1';
 
-  if (error) {
-    return null;
-  }
+  const { rows } = await authPool.query(sql, params);
 
-  return data && data.length > 0 ? data[0] : null;
+  return rows && rows.length > 0 ? rows[0] : null;
 }
 
 /**
@@ -168,20 +152,15 @@ async function getTenantUser(userId, tenantId = null) {
  * @returns {Object|null} Tenant user record with tenant info
  */
 async function getUserTenantWithDetails(userId) {
-  const supabase = getAuthSupabaseAdmin();
+  const authPool = getAuthPool();
 
   // Get tenant_user record for this user (active status)
-  const { data: tuData, error: tuError } = await supabase
-    .schema('auth_tenant')
-    .from('tenant_users')
-    .select('*')
-    .eq('user_id', userId)
-    .eq('status', 'active')
-    .limit(1);
-
-  if (tuError) {
-    return null;
-  }
+  const { rows: tuData } = await authPool.query(
+    `SELECT * FROM auth_tenant.tenant_users
+     WHERE user_id = $1 AND status = 'active'
+     LIMIT 1`,
+    [userId]
+  );
 
   if (!tuData || tuData.length === 0) {
     return null;
@@ -190,17 +169,13 @@ async function getUserTenantWithDetails(userId) {
   const tenantUser = tuData[0];
 
   // Get tenant details
-  const { data: tData, error: tError } = await supabase
-    .schema('auth_tenant')
-    .from('tenants')
-    .select('id, uuid, name, subdomain, redirect_url, client_id, client_secret, status, settings, backend_url, supabase_url, qr_enabled, qr_mode, qr_user_active, timezone')
-    .eq('id', tenantUser.tenant_id)
-    .is('deleted_at', null)
-    .limit(1);
-
-  if (tError) {
-    return null;
-  }
+  const { rows: tData } = await authPool.query(
+    `SELECT id, uuid, name, subdomain, redirect_url, client_id, client_secret, status, settings, backend_url, supabase_url, qr_enabled, qr_mode, qr_user_active, timezone
+     FROM auth_tenant.tenants
+     WHERE id = $1 AND deleted_at IS NULL
+     LIMIT 1`,
+    [tenantUser.tenant_id]
+  );
 
   if (!tData || tData.length === 0) {
     return null;
@@ -219,21 +194,22 @@ async function getUserTenantWithDetails(userId) {
  * @param {Object} params - Attempt parameters
  */
 async function recordLoginAttempt({ email, userId, tenantId, success, failureReason, ipAddress, userAgent }) {
-  const supabase = getAuthSupabaseAdmin();
+  const authPool = getAuthPool();
 
   try {
-    await supabase
-      .schema('auth_tenant')
-      .from('login_attempts')
-      .insert({
-        email: email?.toLowerCase()?.trim(),
-        user_id: userId || null,
-        tenant_id: tenantId || null,
+    await authPool.query(
+      `INSERT INTO auth_tenant.login_attempts (email, user_id, tenant_id, success, failure_reason, ip_address, user_agent)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+      [
+        email?.toLowerCase()?.trim(),
+        userId || null,
+        tenantId || null,
         success,
-        failure_reason: failureReason || null,
-        ip_address: ipAddress || null,
-        user_agent: userAgent || null
-      });
+        failureReason || null,
+        ipAddress || null,
+        userAgent || null
+      ]
+    );
   } catch (error) {
     // Don't fail the login if logging fails
     console.error('Failed to record login attempt:', error);
@@ -245,14 +221,13 @@ async function recordLoginAttempt({ email, userId, tenantId, success, failureRea
  * @param {number} userId - User ID
  */
 async function updateLastLogin(userId) {
-  const supabase = getAuthSupabaseAdmin();
+  const authPool = getAuthPool();
 
   try {
-    await supabase
-      .schema('auth_tenant')
-      .from('users')
-      .update({ last_login_at: new Date().toISOString() })
-      .eq('id', userId);
+    await authPool.query(
+      'UPDATE auth_tenant.users SET last_login_at = $1 WHERE id = $2',
+      [new Date().toISOString(), userId]
+    );
   } catch (error) {
     console.error('Failed to update last login:', error);
   }
@@ -548,28 +523,25 @@ async function exchangeCodeForUserInfo({ code, client_secret, device_info }) {
 
     // Step 8: Register/update device if device info is provided (SAME AS /api/auth/login)
     // user_devices.user_id FKs to the tenant's public.users(id), which mirrors
-    // the tenant's auth.users.id — NOT the central auth_tenant.users.uuid we
+    // the tenant's auth.users.id -- NOT the central auth_tenant.users.uuid we
     // hold in `user.uuid`. Resolve the tenant-side user id by email; skip
     // device registration if no tenant user row exists for this email.
     if (device_info) {
       try {
-        const tenantSupabase = getSupabaseAdmin();
-        const { data: tenantUserRows, error: tenantUserErr } = await tenantSupabase
-          .from('users')
-          .select('id')
-          .eq('email', user.email.toLowerCase().trim())
-          .limit(1);
+        const pool = getPool();
+        const { rows: tenantUserRows } = await pool.query(
+          'SELECT id FROM users WHERE email = $1 LIMIT 1',
+          [user.email.toLowerCase().trim()]
+        );
 
-        if (tenantUserErr) {
-          console.error('⚠️  Tenant user lookup failed during exchange-code:', tenantUserErr.message);
-        } else if (!tenantUserRows || tenantUserRows.length === 0) {
-          console.warn(`⚠️  No tenant user row found for ${user.email}; skipping device registration`);
+        if (!tenantUserRows || tenantUserRows.length === 0) {
+          console.warn(`No tenant user row found for ${user.email}; skipping device registration`);
         } else {
           await deviceService.registerOrUpdateDevice(tenantUserRows[0].id, device_info);
         }
       } catch (deviceError) {
         // Log device registration error but don't fail login (same behavior as /api/auth/login)
-        console.error('⚠️  Device registration failed during exchange-code:', deviceError.message);
+        console.error('Device registration failed during exchange-code:', deviceError.message);
       }
     }
 
@@ -583,32 +555,34 @@ async function exchangeCodeForUserInfo({ code, client_secret, device_info }) {
     let userTimezone = CDT_DEFAULT;
     let companyTimezone = null;
     try {
-      const tenantSupabase = getSupabaseAdmin();
+      const pool = getPool();
 
       // Resolve company/tenant timezone first (always needed for company_timezone field)
       if (tenant.timezone) {
         const tenantTz = tenant.timezone;
         const ianaCode = typeof tenantTz === 'string' ? tenantTz : (tenantTz.iana || tenantTz.iana_code);
         if (ianaCode) {
-          const { data: companyTzData } = await tenantSupabase
-            .from('timezones')
-            .select('id, iana_code, display_name, abbreviation, utc_offset, dst_offset')
-            .eq('iana_code', ianaCode)
-            .maybeSingle();
+          const { rows: companyTzRows } = await pool.query(
+            `SELECT id, iana_code, display_name, abbreviation, utc_offset, dst_offset
+             FROM timezones WHERE iana_code = $1 LIMIT 1`,
+            [ianaCode]
+          );
 
-          if (companyTzData) {
-            companyTimezone = companyTzData;
+          if (companyTzRows && companyTzRows.length > 0) {
+            companyTimezone = companyTzRows[0];
           }
         }
       }
 
       // Check user's saved preference first
-      const { data: prefData } = await tenantSupabase
-        .from('user_preferences')
-        .select('preference_value')
-        .eq('user_id', user.uuid)
-        .eq('preference_key', 'timezone')
-        .maybeSingle();
+      const { rows: prefRows } = await pool.query(
+        `SELECT preference_value FROM user_preferences
+         WHERE user_id = $1 AND preference_key = 'timezone'
+         LIMIT 1`,
+        [user.uuid]
+      );
+
+      const prefData = prefRows && prefRows.length > 0 ? prefRows[0] : null;
 
       if (prefData?.preference_value != null) {
         const pv = prefData.preference_value;
@@ -616,23 +590,23 @@ async function exchangeCodeForUserInfo({ code, client_secret, device_info }) {
 
         // Handle object format: { iana: "America/Chicago" }
         if (typeof pv === 'object' && pv.iana) {
-          const { data } = await tenantSupabase
-            .from('timezones')
-            .select('id, iana_code, display_name, abbreviation, utc_offset, dst_offset')
-            .eq('iana_code', pv.iana)
-            .maybeSingle();
-          tzData = data;
+          const { rows: tzRows } = await pool.query(
+            `SELECT id, iana_code, display_name, abbreviation, utc_offset, dst_offset
+             FROM timezones WHERE iana_code = $1 LIMIT 1`,
+            [pv.iana]
+          );
+          tzData = tzRows && tzRows.length > 0 ? tzRows[0] : null;
         }
         // Handle numeric ID format: 2
         else {
           const tzId = typeof pv === 'number' ? pv : Number(pv);
           if (!isNaN(tzId)) {
-            const { data } = await tenantSupabase
-              .from('timezones')
-              .select('id, iana_code, display_name, abbreviation, utc_offset, dst_offset')
-              .eq('id', tzId)
-              .maybeSingle();
-            tzData = data;
+            const { rows: tzRows } = await pool.query(
+              `SELECT id, iana_code, display_name, abbreviation, utc_offset, dst_offset
+               FROM timezones WHERE id = $1 LIMIT 1`,
+              [tzId]
+            );
+            tzData = tzRows && tzRows.length > 0 ? tzRows[0] : null;
           }
         }
 
@@ -689,7 +663,7 @@ async function exchangeCodeForUserInfo({ code, client_secret, device_info }) {
             tenant_client_id: tenant.client_id,
             tenant_supabase_url: tenant.supabase_url || null,
             // Fall back to the per-tenant API host when backend_url is unset in the
-            // DB — matches the admin federated-login behavior so the mobile app
+            // DB -- matches the admin federated-login behavior so the mobile app
             // never receives a null backend_url (which crashes normalizeBackendUrl).
             tenant_backend_url: tenant.backend_url || `https://${tenant.subdomain}-api.truckast.ai`,
             qr_enabled: tenant.qr_enabled ?? false,
@@ -722,20 +696,14 @@ async function exchangeCodeForUserInfo({ code, client_secret, device_info }) {
  */
 async function getUserTenants(userId) {
   try {
-    const supabase = getAuthSupabaseAdmin();
+    const authPool = getAuthPool();
 
     // Get all active tenant_user records for this user
-    const { data: tuData, error: tuError } = await supabase
-      .schema('auth_tenant')
-      .from('tenant_users')
-      .select('tenant_id')
-      .eq('user_id', userId)
-      .eq('status', 'active');
-
-    if (tuError) {
-      console.error('[MobileAuth] Error fetching tenant_users:', tuError.message);
-      return { success: false, error_code: ERROR_CODES.SERVER_ERROR, message: ERROR_MESSAGES.SERVER_ERROR };
-    }
+    const { rows: tuData } = await authPool.query(
+      `SELECT tenant_id FROM auth_tenant.tenant_users
+       WHERE user_id = $1 AND status = 'active'`,
+      [userId]
+    );
 
     if (!tuData || tuData.length === 0) {
       return { success: true, data: [] };
@@ -746,19 +714,13 @@ async function getUserTenants(userId) {
     // Get tenant details for all matching tenants
     // supabase_url / supabase_anon_key / supabase_service_key are returned as
     // stored in DB (encrypted). Mobile client decrypts with the shared key.
-    const { data: tenants, error: tError } = await supabase
-      .schema('auth_tenant')
-      .from('tenants')
-      .select('id, uuid, name, subdomain, backend_url, status, image_url, supabase_url, supabase_anon_key, supabase_service_key')
-      .in('id', tenantIds)
-      .is('deleted_at', null)
-      .eq('status', 'active')
-      .order('name', { ascending: true });
-
-    if (tError) {
-      console.error('[MobileAuth] Error fetching tenants:', tError.message);
-      return { success: false, error_code: ERROR_CODES.SERVER_ERROR, message: ERROR_MESSAGES.SERVER_ERROR };
-    }
+    const { rows: tenants } = await authPool.query(
+      `SELECT id, uuid, name, subdomain, backend_url, status, image_url, supabase_url, supabase_anon_key, supabase_service_key
+       FROM auth_tenant.tenants
+       WHERE id = ANY($1) AND deleted_at IS NULL AND status = 'active'
+       ORDER BY name ASC`,
+      [tenantIds]
+    );
 
     return {
       success: true,
@@ -794,18 +756,18 @@ async function getUserTenants(userId) {
  */
 async function generateSwitchCode({ userId, email, targetSubdomain }) {
   try {
-    const supabase = getAuthSupabaseAdmin();
+    const authPool = getAuthPool();
 
     // Step 1: Look up target tenant by subdomain
-    const { data: tData, error: tError } = await supabase
-      .schema('auth_tenant')
-      .from('tenants')
-      .select('id, uuid, name, subdomain, redirect_url, client_id, client_secret, status, backend_url, supabase_url, supabase_anon_key, supabase_service_key, qr_enabled, qr_mode, qr_user_active')
-      .eq('subdomain', targetSubdomain.toLowerCase().trim())
-      .is('deleted_at', null)
-      .limit(1);
+    const { rows: tData } = await authPool.query(
+      `SELECT id, uuid, name, subdomain, redirect_url, client_id, client_secret, status, backend_url, supabase_url, supabase_anon_key, supabase_service_key, qr_enabled, qr_mode, qr_user_active
+       FROM auth_tenant.tenants
+       WHERE subdomain = $1 AND deleted_at IS NULL
+       LIMIT 1`,
+      [targetSubdomain.toLowerCase().trim()]
+    );
 
-    if (tError || !tData || tData.length === 0) {
+    if (!tData || tData.length === 0) {
       return { success: false, error_code: ERROR_CODES.NO_TENANT, message: ERROR_MESSAGES.NO_TENANT };
     }
 

@@ -4,12 +4,15 @@
  * Handles password reset requests with:
  * - Rate limiting (5 minutes per email)
  * - User verification
- * - Token generation via Supabase Admin API
+ * - Token generation (crypto-based)
  * - Password reset email sending
  */
 
-const { getSupabaseAdmin } = require('../config/database');
+const { getPool } = require('../config/database');
+const { getAuthPool } = require('../config/authDatabase');
 const { executeDirectSQL } = require('../utils/postgresExecutor');
+const { hashPassword } = require('../utils/encryptionUtils');
+const crypto = require('crypto');
 const nodemailer = require('nodemailer');
 
 // Rate limiting configuration
@@ -18,6 +21,9 @@ const rateLimitMap = new Map(); // In-memory store for rate limiting
 
 // Cached SMTP transporter (created once, reused across requests)
 let _cachedTransporter = null;
+
+// Token expiry: 1 hour
+const TOKEN_EXPIRY_MS = 60 * 60 * 1000;
 
 /**
  * Check if email is rate limited
@@ -50,7 +56,7 @@ function setRateLimit(email) {
 
 /**
  * Verify if user exists in the system
- * First checks users table, then falls back to Supabase auth.users
+ * Checks users table (public schema), then falls back to auth_tenant.users
  * @param {string} email - User email
  * @returns {object|null} User data or null if not found
  */
@@ -76,42 +82,20 @@ async function verifyUserExists(email) {
       };
     }
 
-    // Step 2: Fall back to checking auth.users via Supabase Admin API
-    const supabaseAdmin = getSupabaseAdmin();
+    // Step 2: Fall back to checking auth_tenant.users
+    const authPool = getAuthPool();
+    const { rows } = await authPool.query(
+      `SELECT id, uuid, email FROM auth_tenant.users
+       WHERE email ILIKE $1 AND deleted_at IS NULL
+       LIMIT 1`,
+      [normalizedEmail]
+    );
 
-    // Paginated listUsers to avoid loading ALL users into memory
-    let page = 1;
-    const perPage = 1000;
-    let authUser = null;
-
-    while (!authUser) {
-      const { data: authData, error: authError } = await supabaseAdmin.auth.admin.listUsers({
-        page,
-        perPage
-      });
-
-      if (authError) {
-        console.error('Error checking auth.users:', authError.message);
-        break;
-      }
-
-      if (!authData || !authData.users || authData.users.length === 0) {
-        break;
-      }
-
-      authUser = authData.users.find(
-        u => u.email && u.email.toLowerCase() === normalizedEmail
-      );
-
-      if (authData.users.length < perPage) break;
-      page++;
-    }
-
-    if (authUser) {
+    if (rows && rows.length > 0) {
       return {
-        id: authUser.id,
-        email: authUser.email,
-        source: 'auth_users'
+        id: rows[0].uuid || rows[0].id,
+        email: rows[0].email,
+        source: 'auth_tenant_users'
       };
     }
 
@@ -123,7 +107,7 @@ async function verifyUserExists(email) {
 }
 
 /**
- * Generate password reset token using Supabase Admin API
+ * Generate password reset token and store it
  * @param {string} email - User email
  * @param {string} redirectTo - URL to redirect after password reset
  * @returns {object} { success: boolean, token?: string, error?: string }
@@ -132,45 +116,59 @@ async function generateResetToken(email, redirectTo) {
   const normalizedEmail = email.toLowerCase().trim();
 
   try {
-    const supabaseAdmin = getSupabaseAdmin();
+    const pool = getPool();
 
-    // Generate recovery link using Supabase Admin API
-    const { data, error } = await supabaseAdmin.auth.admin.generateLink({
-      type: 'recovery',
-      email: normalizedEmail,
-      options: {
-        redirectTo: redirectTo || process.env.PASSWORD_RESET_REDIRECT_URL || (process.env.NEXT_PUBLIC_APP_URL ? `${process.env.NEXT_PUBLIC_APP_URL}/reset-password` : 'http://localhost:3000/reset-password')
-      }
+    // Generate a secure random token
+    const token = crypto.randomBytes(32).toString('hex');
+    const hashedToken = crypto.createHash('sha256').update(token).digest('hex');
+    const expiresAt = new Date(Date.now() + TOKEN_EXPIRY_MS).toISOString();
+
+    // Store token in password_reset_tokens table (create if not exists)
+    // Delete any existing tokens for this email first
+    await pool.query(
+      'DELETE FROM password_reset_tokens WHERE email = $1',
+      [normalizedEmail]
+    ).catch(() => {
+      // Table may not exist yet, will be created by the insert or migration
     });
 
-    if (error) {
-      console.error('Error generating reset link:', error.message);
-      return { success: false, error: error.message };
-    }
-
-    if (!data || !data.properties || !data.properties.hashed_token) {
-      // Extract token from the action link if hashed_token not available
-      if (data && data.properties && data.properties.action_link) {
-        const actionLink = data.properties.action_link;
-        const urlParams = new URL(actionLink);
-        const token = urlParams.searchParams.get('token') || urlParams.hash.split('access_token=')[1]?.split('&')[0];
-
-        if (token) {
-          return {
-            success: true,
-            token: token,
-            actionLink: actionLink
-          };
-        }
+    try {
+      await pool.query(
+        `INSERT INTO password_reset_tokens (email, token_hash, expires_at)
+         VALUES ($1, $2, $3)`,
+        [normalizedEmail, hashedToken, expiresAt]
+      );
+    } catch (insertErr) {
+      // If table doesn't exist, create it and retry
+      if (insertErr.code === '42P01') {
+        await pool.query(`
+          CREATE TABLE IF NOT EXISTS password_reset_tokens (
+            id SERIAL PRIMARY KEY,
+            email TEXT NOT NULL,
+            token_hash TEXT NOT NULL,
+            expires_at TIMESTAMPTZ NOT NULL,
+            consumed_at TIMESTAMPTZ,
+            created_at TIMESTAMPTZ DEFAULT NOW()
+          )
+        `);
+        await pool.query(
+          `INSERT INTO password_reset_tokens (email, token_hash, expires_at)
+           VALUES ($1, $2, $3)`,
+          [normalizedEmail, hashedToken, expiresAt]
+        );
+      } else {
+        throw insertErr;
       }
-
-      return { success: false, error: 'Failed to generate reset token' };
     }
+
+    // Build the action link
+    const baseUrl = redirectTo || process.env.PASSWORD_RESET_REDIRECT_URL || (process.env.NEXT_PUBLIC_APP_URL ? `${process.env.NEXT_PUBLIC_APP_URL}/reset-password` : 'http://localhost:3000/reset-password');
+    const actionLink = `${baseUrl}?token=${token}&email=${encodeURIComponent(normalizedEmail)}`;
 
     return {
       success: true,
-      token: data.properties.hashed_token,
-      actionLink: data.properties.action_link
+      token: token,
+      actionLink: actionLink
     };
   } catch (error) {
     console.error('Error generating reset token:', error.message);
@@ -450,25 +448,7 @@ async function requestPasswordReset(email, redirectTo = null) {
   console.log('[ForgotPassword] Step 4 Passed: Token generated');
 
   // Step 5: Build reset URL
-  const baseUrl = redirectTo || process.env.PASSWORD_RESET_REDIRECT_URL || (process.env.NEXT_PUBLIC_APP_URL ? `${process.env.NEXT_PUBLIC_APP_URL}/reset-password` : 'http://localhost:3000/reset-password');
-  console.log('[ForgotPassword] Step 5: Using baseUrl -', baseUrl);
-  console.log('[ForgotPassword] Step 5: Env vars - PASSWORD_RESET_REDIRECT_URL:', process.env.PASSWORD_RESET_REDIRECT_URL, 'NEXT_PUBLIC_APP_URL:', process.env.NEXT_PUBLIC_APP_URL);
-  
-  // Extract token from actionLink if it exists, otherwise use token from result
-  let resetToken = tokenResult.token;
-  if (tokenResult.actionLink && !resetToken) {
-    try {
-      const urlParams = new URL(tokenResult.actionLink);
-      resetToken = urlParams.searchParams.get('token') || urlParams.searchParams.get('access_token') || 
-                   urlParams.hash.split('access_token=')[1]?.split('&')[0];
-      console.log('[ForgotPassword] Step 5: Extracted token from actionLink');
-    } catch (e) {
-      console.log('[ForgotPassword] Could not extract token from actionLink:', e.message);
-    }
-  }
-  
-  // Always build our own reset link with the correct production URL
-  const resetLink = resetToken ? `${baseUrl}?token=${resetToken}&email=${encodeURIComponent(normalizedEmail)}` : tokenResult.actionLink;
+  const resetLink = tokenResult.actionLink;
   console.log('[ForgotPassword] Step 5: Reset link built -', resetLink);
 
   // Step 6: Send reset email

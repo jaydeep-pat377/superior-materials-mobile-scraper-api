@@ -1,4 +1,4 @@
-const { getNotificationSupabase } = require('../config/notificationDatabase');
+const { getNotificationPool } = require('../config/notificationDatabase');
 const { getMessaging } = require('../config/Firebase');
 
 const FCM_BATCH_SIZE = 500;
@@ -144,91 +144,83 @@ async function sendPushNotificationToMultipleBatched(deviceTokens, title, body, 
 }
 
 /**
- * Get active device tokens for a user from notification Supabase
+ * Get active device tokens for a user from notification database
  */
 async function getUserDeviceTokens(userId) {
-  const supabase = getNotificationSupabase();
+  const pool = getNotificationPool();
 
-  const { data, error } = await supabase
-    .from('user_devices')
-    .select('device_token')
-    .eq('user_id', userId)
-    .eq('is_active', true);
+  const { rows } = await pool.query(
+    'SELECT device_token FROM user_devices WHERE user_id = $1 AND is_active = true',
+    [userId]
+  );
 
-  if (error) throw new Error(`Failed to fetch device tokens: ${error.message}`);
-
-  return (data || []).map(d => d.device_token).filter(Boolean);
+  return (rows || []).map(d => d.device_token).filter(Boolean);
 }
 
 /**
- * Check single device token in notification Supabase
+ * Check single device token in notification database
  */
 async function checkDeviceToken(deviceToken) {
-  const supabase = getNotificationSupabase();
+  const pool = getNotificationPool();
 
-  const { data, error } = await supabase
-    .from('user_devices')
-    .select('id, user_id, device_id, device_token, device_name, device_type, is_active')
-    .eq('device_token', deviceToken)
-    .eq('is_active', true)
-    .single();
+  try {
+    const { rows } = await pool.query(
+      'SELECT id, user_id, device_id, device_token, device_name, device_type, is_active FROM user_devices WHERE device_token = $1 AND is_active = true LIMIT 1',
+      [deviceToken]
+    );
 
-  if (error && error.code !== 'PGRST116') {
-    console.error('⚠️  Error checking device token:', error.message);
+    return rows[0] || null;
+  } catch (err) {
+    console.error('Warning: Error checking device token:', err.message);
     return null;
   }
-
-  return data || null;
 }
 
 /**
- * Batch check device tokens in notification Supabase
+ * Batch check device tokens in notification database
  */
 async function batchCheckDeviceTokens(deviceTokens) {
   if (!Array.isArray(deviceTokens) || deviceTokens.length === 0) return {};
 
-  const supabase = getNotificationSupabase();
+  const pool = getNotificationPool();
 
-  const { data, error } = await supabase
-    .from('user_devices')
-    .select('id, user_id, device_id, device_token, device_name, device_type, is_active')
-    .in('device_token', deviceTokens)
-    .eq('is_active', true);
+  try {
+    const { rows } = await pool.query(
+      'SELECT id, user_id, device_id, device_token, device_name, device_type, is_active FROM user_devices WHERE device_token = ANY($1) AND is_active = true',
+      [deviceTokens]
+    );
 
-  if (error) {
-    console.error('⚠️  Error batch checking device tokens:', error.message);
+    const tokenMap = {};
+    (rows || []).forEach(device => {
+      tokenMap[device.device_token] = device;
+    });
+
+    return tokenMap;
+  } catch (err) {
+    console.error('Warning: Error batch checking device tokens:', err.message);
     return {};
   }
-
-  const tokenMap = {};
-  (data || []).forEach(device => {
-    tokenMap[device.device_token] = device;
-  });
-
-  return tokenMap;
 }
 
 /**
- * Batch deactivate invalid tokens in notification Supabase
+ * Batch deactivate invalid tokens in notification database
  */
 async function batchDeactivateTokens(deviceTokens) {
   if (!Array.isArray(deviceTokens) || deviceTokens.length === 0) return 0;
 
-  const supabase = getNotificationSupabase();
+  const pool = getNotificationPool();
 
-  const { data, error } = await supabase
-    .from('user_devices')
-    .update({ is_active: false })
-    .in('device_token', deviceTokens)
-    .eq('is_active', true)
-    .select('id');
+  try {
+    const { rowCount } = await pool.query(
+      'UPDATE user_devices SET is_active = false WHERE device_token = ANY($1) AND is_active = true',
+      [deviceTokens]
+    );
 
-  if (error) {
-    console.error('⚠️  Error deactivating tokens:', error.message);
+    return rowCount || 0;
+  } catch (err) {
+    console.error('Warning: Error deactivating tokens:', err.message);
     return 0;
   }
-
-  return data?.length || 0;
 }
 
 module.exports = {

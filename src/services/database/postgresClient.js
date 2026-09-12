@@ -31,7 +31,7 @@ if (DATABASE_URL) {
    *
    * Configuration:
    * - max: Maximum number of connections (20)
-   * - idleTimeoutMillis: Close idle connections after 60s (Supabase pooler closes idle conns; we release first to avoid "Connection terminated unexpectedly")
+   * - idleTimeoutMillis: Close idle connections after 60s
    * - connectionTimeoutMillis: Fail connection attempts after 15 seconds
    */
   pool = new Pool({
@@ -41,8 +41,7 @@ if (DATABASE_URL) {
     idleTimeoutMillis: 60000,
     connectionTimeoutMillis: 15000,
     statement_timeout: QUERY_TIMEOUT_MS,  // Kill queries exceeding this time
-    // SSL configuration for Supabase
-    ssl: DATABASE_URL.includes('supabase') ? { rejectUnauthorized: false } : false
+    ssl: DATABASE_URL.includes('localhost') ? false : { rejectUnauthorized: false }
   });
 
   // Log pool errors (short message only; full dump is noisy for "Connection terminated unexpectedly")

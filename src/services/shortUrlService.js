@@ -7,7 +7,7 @@
  * - Increment click count
  */
 
-const { getAuthSupabaseAdmin } = require('../config/authDatabase');
+const { getAuthPool } = require('../config/authDatabase');
 
 /**
  * Resolve a short URL by its code
@@ -15,27 +15,30 @@ const { getAuthSupabaseAdmin } = require('../config/authDatabase');
  * @returns {Object} { success, data, error, error_code }
  */
 async function resolveShortUrl(code) {
-  const supabase = getAuthSupabaseAdmin();
+  const authPool = getAuthPool();
 
   // Look up the short URL record
-  const { data, error: fetchError } = await supabase
-    .schema('auth_tenant')
-    .from('short_urls')
-    .select('id, code, tenant_slug, original_url, expires_at, click_count')
-    .eq('code', code)
-    .limit(1);
-
-  if (fetchError) {
+  let rows;
+  try {
+    const result = await authPool.query(
+      `SELECT id, code, tenant_slug, original_url, expires_at, click_count
+       FROM auth_tenant.short_urls
+       WHERE code = $1
+       LIMIT 1`,
+      [code]
+    );
+    rows = result.rows;
+  } catch (fetchError) {
     console.error('[ShortUrl] Database error:', fetchError.message);
     return { success: false, data: null, error: 'Failed to resolve short URL', error_code: 'DB_ERROR' };
   }
 
-  if (!data || data.length === 0) {
+  if (!rows || rows.length === 0) {
     console.warn('[ShortUrl] Code not found:', code);
     return { success: false, data: null, error: 'Short URL not found', error_code: 'NOT_FOUND' };
   }
 
-  const record = data[0];
+  const record = rows[0];
 
   // Check expiry if expires_at is set
   if (record.expires_at) {
@@ -46,28 +49,15 @@ async function resolveShortUrl(code) {
     }
   }
 
-  // Increment click_count atomically and update last_accessed_at (fire-and-forget)
-  supabase
-    .rpc('increment_short_url_click', { short_url_id: record.id })
-    .then(({ error: updateError }) => {
-      if (updateError) {
-        // Fallback to non-atomic update if RPC not available
-        console.warn('[ShortUrl] RPC increment failed, using fallback:', updateError.message);
-        supabase
-          .schema('auth_tenant')
-          .from('short_urls')
-          .update({
-            click_count: (record.click_count || 0) + 1,
-            last_accessed_at: new Date().toISOString(),
-          })
-          .eq('id', record.id)
-          .then(({ error: fallbackError }) => {
-            if (fallbackError) {
-              console.error('[ShortUrl] Fallback increment also failed:', fallbackError.message);
-            }
-          });
-      }
-    });
+  // Increment click_count and update last_accessed_at (fire-and-forget)
+  authPool.query(
+    `UPDATE auth_tenant.short_urls
+     SET click_count = click_count + 1, last_accessed_at = $1
+     WHERE id = $2`,
+    [new Date().toISOString(), record.id]
+  ).catch((updateError) => {
+    console.error('[ShortUrl] Click count increment failed:', updateError.message);
+  });
 
   return {
     success: true,

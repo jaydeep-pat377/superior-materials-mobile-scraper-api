@@ -1,4 +1,4 @@
-const { getSupabaseAdmin } = require('../config/database');
+const { getPool } = require('../config/database');
 
 // Fallback timezone when no tenant/user timezone is available
 const FALLBACK_TZ = 'America/Chicago';
@@ -205,77 +205,92 @@ function formatOrderRow(row, tz, tenantTz) {
 
 // Get order requests with pagination, filtering, and search
 async function getOrderRequests({ userId, userIds, isAdmin, userType, page = 1, limit = 15, status, search, tz, tenantTz } = {}) {
-  const supabase = getSupabaseAdmin();
+  const pool = getPool();
 
   // For contractor filtering, use userIds array (handles UUID migration)
   // Falls back to [userId] if userIds not provided (backward compatibility)
   const contractorIds = userIds && userIds.length > 0 ? userIds : (userId ? [userId] : []);
 
-  // --- DB-level counts in parallel (head:true = no rows transferred) ---
-  const buildCountQuery = () => {
-    let q = supabase.from('order_entities').select('*', { count: 'exact', head: true });
-    if (!isAdmin && userType !== 'producer' && contractorIds.length > 0) {
-      q = q.in('user_id', contractorIds);
-    }
-    return q;
-  };
+  // --- Build user scope WHERE clause ---
+  const needsUserScope = !isAdmin && userType !== 'producer' && contractorIds.length > 0;
+  let userScopeSQL = '';
+  let userScopeParams = [];
+  if (needsUserScope) {
+    userScopeSQL = ' AND user_id = ANY($1)';
+    userScopeParams = [contractorIds];
+  }
 
+  // --- DB-level counts in parallel ---
+  const countBaseSQL = `SELECT COUNT(*) FROM order_entities WHERE 1=1${userScopeSQL}`;
   const [totalRes, pendingRes, submittedRes, approvedRes, rejectedRes] = await Promise.all([
-    buildCountQuery(),
-    buildCountQuery().eq('status', 'pending'),
-    buildCountQuery().eq('status', 'submitted'),
-    buildCountQuery().eq('status', 'approved'),
-    buildCountQuery().in('status', ['rejected', 'canceled']),
+    pool.query(countBaseSQL, userScopeParams),
+    pool.query(`${countBaseSQL} AND status = $${userScopeParams.length + 1}`, [...userScopeParams, 'pending']),
+    pool.query(`${countBaseSQL} AND status = $${userScopeParams.length + 1}`, [...userScopeParams, 'submitted']),
+    pool.query(`${countBaseSQL} AND status = $${userScopeParams.length + 1}`, [...userScopeParams, 'approved']),
+    pool.query(`${countBaseSQL} AND status = ANY($${userScopeParams.length + 1})`, [...userScopeParams, ['rejected', 'canceled']]),
   ]);
 
-  const countError = totalRes.error || pendingRes.error || submittedRes.error || approvedRes.error || rejectedRes.error;
-  if (countError) throw new Error(`Failed to fetch counts: ${countError.message}`);
-
   const counts = {
-    total: totalRes.count || 0,
-    pending: pendingRes.count || 0,
-    submitted: submittedRes.count || 0,
-    approved: approvedRes.count || 0,
-    rejected: rejectedRes.count || 0,
+    total: parseInt(totalRes.rows[0].count, 10) || 0,
+    pending: parseInt(pendingRes.rows[0].count, 10) || 0,
+    submitted: parseInt(submittedRes.rows[0].count, 10) || 0,
+    approved: parseInt(approvedRes.rows[0].count, 10) || 0,
+    rejected: parseInt(rejectedRes.rows[0].count, 10) || 0,
   };
 
   // --- Build paginated data query ---
-  let query = supabase.from('order_entities').select('*', { count: 'exact' });
+  let conditions = ['1=1'];
+  let params = [];
+  let paramIndex = 1;
 
   // Scope by user if not admin/producer (contractor sees only their own)
-  if (!isAdmin && userType !== 'producer' && contractorIds.length > 0) {
-    query = query.in('user_id', contractorIds);
+  if (needsUserScope) {
+    conditions.push(`user_id = ANY($${paramIndex})`);
+    params.push(contractorIds);
+    paramIndex++;
   }
 
   // Status filter
   if (status && status !== 'all') {
     if (status === 'rejected') {
-      query = query.in('status', ['rejected', 'canceled']);
+      conditions.push(`status = ANY($${paramIndex})`);
+      params.push(['rejected', 'canceled']);
+      paramIndex++;
     } else {
-      query = query.eq('status', status);
+      conditions.push(`status = $${paramIndex}`);
+      params.push(status);
+      paramIndex++;
     }
   }
 
   // Search filter
   if (search && search.trim()) {
-    const q = search.trim();
-    query = query.or(
-      `job_name.ilike.%${q}%,company_name.ilike.%${q}%,job_address.ilike.%${q}%,job_city.ilike.%${q}%,concrete_product_name.ilike.%${q}%,po_number.ilike.%${q}%`
-    );
+    const q = `%${search.trim()}%`;
+    conditions.push(`(job_name ILIKE $${paramIndex} OR company_name ILIKE $${paramIndex} OR job_address ILIKE $${paramIndex} OR job_city ILIKE $${paramIndex} OR concrete_product_name ILIKE $${paramIndex} OR po_number ILIKE $${paramIndex})`);
+    params.push(q);
+    paramIndex++;
   }
 
-  // Ordering and pagination
   const offset = (page - 1) * limit;
-  query = query.order('created_at', { ascending: false }).range(offset, offset + limit - 1);
+  const whereClause = conditions.join(' AND ');
 
-  const { data, count, error } = await query;
-  if (error) throw new Error(`Failed to fetch order requests: ${error.message}`);
+  // Get data + total count in parallel
+  const [dataResult, countResult] = await Promise.all([
+    pool.query(
+      `SELECT * FROM order_entities WHERE ${whereClause} ORDER BY created_at DESC LIMIT $${paramIndex} OFFSET $${paramIndex + 1}`,
+      [...params, limit, offset]
+    ),
+    pool.query(
+      `SELECT COUNT(*) FROM order_entities WHERE ${whereClause}`,
+      params
+    )
+  ]);
 
-  const total = count || 0;
+  const total = parseInt(countResult.rows[0].count, 10) || 0;
   const totalPages = Math.ceil(total / limit);
 
   return {
-    orders: (data || []).map(row => formatOrderRow(row, tz, tenantTz)),
+    orders: (dataResult.rows || []).map(row => formatOrderRow(row, tz, tenantTz)),
     counts,
     pagination: {
       page,
@@ -289,141 +304,176 @@ async function getOrderRequests({ userId, userIds, isAdmin, userType, page = 1, 
 
 // Get single order request by ID
 async function getOrderRequestById(id, tz = null, tenantTz = null) {
-  const supabase = getSupabaseAdmin();
-  const { data, error } = await supabase
-    .from('order_entities')
-    .select('*')
-    .eq('id', id)
-    .single();
+  const pool = getPool();
+  const { rows } = await pool.query(
+    'SELECT * FROM order_entities WHERE id = $1',
+    [id]
+  );
 
-  if (error) throw new Error(`Order request not found: ${error.message}`);
+  if (rows.length === 0) throw new Error('Order request not found');
+  const data = rows[0];
   return tz ? formatOrderRow(data, tz, tenantTz) : data;
 }
 
 // Create order request
 async function createOrderRequest(input, tenantTz = null) {
-  const supabase = getSupabaseAdmin();
-  const { data, error } = await supabase
-    .from('order_entities')
-    .insert({
-      user_id: input.user_id,
-      order_type: input.order_type || 'without_project',
-      project_code: input.project_code || null,
-      project_name: input.project_name || null,
-      company_id: input.company_id,
-      company_name: input.company_name || null,
-      referenced_order: input.referenced_order || null,
-      region_code: input.region_code || null,
-      region_name: input.region_name || null,
-      customer_job_number: input.customer_job_number || null,
-      usage_code: input.usage_code || null,
-      usage_name: input.usage_name || null,
-      pour_method_code: input.pour_method_code || null,
-      pour_method_name: input.pour_method_name || null,
-      po_number: input.po_number || null,
-      order_status: input.order_status ?? 0,
-      on_job_date: input.on_job_date,
-      on_job_time: convertTimeToUtc(input.on_job_date, input.on_job_time, tenantTz),
-      job_name: input.job_name || null,
-      plant_code: input.plant_code || null,
-      plant_name: input.plant_name || null,
-      job_address: input.job_address,
-      job_city: input.job_city,
-      job_state: input.job_state || null,
-      job_zip_code: input.job_zip_code || null,
-      job_contact_name: input.job_contact_name,
-      job_contact_phone: input.job_contact_phone,
-      driver_instructions: input.driver_instructions || null,
-      know_mix_code: input.know_mix_code ?? false,
-      concrete_product_code: input.concrete_product_code || null,
-      concrete_product_name: input.concrete_product_name || null,
-      concrete_product_text: input.concrete_product_text || null,
-      psi: input.psi || null,
-      rock_size: input.rock_size || null,
-      air_non_air: input.air_non_air || null,
-      fly_ash: input.fly_ash || null,
-      quantity: input.quantity || null,
-      truck_spacing: input.truck_spacing || null,
-      spacing_type: input.spacing_type || 'minutes',
-      slump: input.slump || null,
-      concrete_notes: input.concrete_notes || null,
-      call_back_load: input.call_back_load || null,
-      pumped: input.pumped ?? false,
-      pump_type: input.pumped ? (input.pump_type || null) : null,
-      admixture_product_code: input.admixture_product_code || null,
-      admixture_product_name: input.admixture_product_name || null,
-      admixture_notes: input.admixture_notes || null,
-      other_product_code: input.other_product_code || null,
-      other_product_name: input.other_product_name || null,
-      other_notes: input.other_notes || null,
-    })
-    .select('id')
-    .single();
+  const pool = getPool();
 
-  if (error) throw new Error(`Failed to create order request: ${error.message}`);
-  return data;
+  const columns = [
+    'user_id', 'order_type', 'project_code', 'project_name', 'company_id', 'company_name',
+    'referenced_order', 'region_code', 'region_name', 'customer_job_number',
+    'usage_code', 'usage_name', 'pour_method_code', 'pour_method_name', 'po_number',
+    'order_status', 'on_job_date', 'on_job_time', 'job_name', 'plant_code', 'plant_name',
+    'job_address', 'job_city', 'job_state', 'job_zip_code',
+    'job_contact_name', 'job_contact_phone', 'driver_instructions',
+    'know_mix_code', 'concrete_product_code', 'concrete_product_name', 'concrete_product_text',
+    'psi', 'rock_size', 'air_non_air', 'fly_ash', 'quantity', 'truck_spacing', 'spacing_type',
+    'slump', 'concrete_notes', 'call_back_load', 'pumped', 'pump_type',
+    'admixture_product_code', 'admixture_product_name', 'admixture_notes',
+    'other_product_code', 'other_product_name', 'other_notes'
+  ];
+
+  const values = [
+    input.user_id,
+    input.order_type || 'without_project',
+    input.project_code || null,
+    input.project_name || null,
+    input.company_id,
+    input.company_name || null,
+    input.referenced_order || null,
+    input.region_code || null,
+    input.region_name || null,
+    input.customer_job_number || null,
+    input.usage_code || null,
+    input.usage_name || null,
+    input.pour_method_code || null,
+    input.pour_method_name || null,
+    input.po_number || null,
+    input.order_status ?? 0,
+    input.on_job_date,
+    convertTimeToUtc(input.on_job_date, input.on_job_time, tenantTz),
+    input.job_name || null,
+    input.plant_code || null,
+    input.plant_name || null,
+    input.job_address,
+    input.job_city,
+    input.job_state || null,
+    input.job_zip_code || null,
+    input.job_contact_name,
+    input.job_contact_phone,
+    input.driver_instructions || null,
+    input.know_mix_code ?? false,
+    input.concrete_product_code || null,
+    input.concrete_product_name || null,
+    input.concrete_product_text || null,
+    input.psi || null,
+    input.rock_size || null,
+    input.air_non_air || null,
+    input.fly_ash || null,
+    input.quantity || null,
+    input.truck_spacing || null,
+    input.spacing_type || 'minutes',
+    input.slump || null,
+    input.concrete_notes || null,
+    input.call_back_load || null,
+    input.pumped ?? false,
+    input.pumped ? (input.pump_type || null) : null,
+    input.admixture_product_code || null,
+    input.admixture_product_name || null,
+    input.admixture_notes || null,
+    input.other_product_code || null,
+    input.other_product_name || null,
+    input.other_notes || null,
+  ];
+
+  const placeholders = values.map((_, i) => `$${i + 1}`).join(', ');
+  const sql = `INSERT INTO order_entities (${columns.join(', ')}) VALUES (${placeholders}) RETURNING id`;
+
+  const { rows } = await pool.query(sql, values);
+  if (rows.length === 0) throw new Error('Failed to create order request');
+  return rows[0];
 }
 
 // Update order request
 async function updateOrderRequest(id, input, tenantTz = null) {
-  const supabase = getSupabaseAdmin();
-  const { error } = await supabase
-    .from('order_entities')
-    .update({
-      order_type: input.order_type || 'without_project',
-      project_code: input.project_code || null,
-      project_name: input.project_name || null,
-      company_id: input.company_id,
-      company_name: input.company_name || null,
-      referenced_order: input.referenced_order || null,
-      region_code: input.region_code || null,
-      region_name: input.region_name || null,
-      customer_job_number: input.customer_job_number || null,
-      usage_code: input.usage_code || null,
-      usage_name: input.usage_name || null,
-      pour_method_code: input.pour_method_code || null,
-      pour_method_name: input.pour_method_name || null,
-      po_number: input.po_number || null,
-      order_status: input.order_status ?? 0,
-      on_job_date: input.on_job_date,
-      on_job_time: convertTimeToUtc(input.on_job_date, input.on_job_time, tenantTz),
-      job_name: input.job_name || null,
-      plant_code: input.plant_code || null,
-      plant_name: input.plant_name || null,
-      job_address: input.job_address,
-      job_city: input.job_city,
-      job_state: input.job_state || null,
-      job_zip_code: input.job_zip_code || null,
-      job_contact_name: input.job_contact_name,
-      job_contact_phone: input.job_contact_phone,
-      driver_instructions: input.driver_instructions || null,
-      know_mix_code: input.know_mix_code ?? false,
-      concrete_product_code: input.concrete_product_code || null,
-      concrete_product_name: input.concrete_product_name || null,
-      concrete_product_text: input.concrete_product_text || null,
-      psi: input.psi || null,
-      rock_size: input.rock_size || null,
-      air_non_air: input.air_non_air || null,
-      fly_ash: input.fly_ash || null,
-      quantity: input.quantity || null,
-      truck_spacing: input.truck_spacing || null,
-      spacing_type: input.spacing_type || 'minutes',
-      slump: input.slump || null,
-      concrete_notes: input.concrete_notes || null,
-      call_back_load: input.call_back_load || null,
-      pumped: input.pumped ?? false,
-      pump_type: input.pumped ? (input.pump_type || null) : null,
-      admixture_product_code: input.admixture_product_code || null,
-      admixture_product_name: input.admixture_product_name || null,
-      admixture_notes: input.admixture_notes || null,
-      other_product_code: input.other_product_code || null,
-      other_product_name: input.other_product_name || null,
-      other_notes: input.other_notes || null,
-      updated_at: new Date().toISOString(),
-    })
-    .eq('id', id);
+  const pool = getPool();
 
-  if (error) throw new Error(`Failed to update order request: ${error.message}`);
+  const sql = `
+    UPDATE order_entities SET
+      order_type = $1, project_code = $2, project_name = $3, company_id = $4,
+      company_name = $5, referenced_order = $6, region_code = $7, region_name = $8,
+      customer_job_number = $9, usage_code = $10, usage_name = $11,
+      pour_method_code = $12, pour_method_name = $13, po_number = $14,
+      order_status = $15, on_job_date = $16, on_job_time = $17,
+      job_name = $18, plant_code = $19, plant_name = $20,
+      job_address = $21, job_city = $22, job_state = $23, job_zip_code = $24,
+      job_contact_name = $25, job_contact_phone = $26, driver_instructions = $27,
+      know_mix_code = $28, concrete_product_code = $29, concrete_product_name = $30,
+      concrete_product_text = $31, psi = $32, rock_size = $33, air_non_air = $34,
+      fly_ash = $35, quantity = $36, truck_spacing = $37, spacing_type = $38,
+      slump = $39, concrete_notes = $40, call_back_load = $41,
+      pumped = $42, pump_type = $43,
+      admixture_product_code = $44, admixture_product_name = $45, admixture_notes = $46,
+      other_product_code = $47, other_product_name = $48, other_notes = $49,
+      updated_at = $50
+    WHERE id = $51
+  `;
+
+  const values = [
+    input.order_type || 'without_project',
+    input.project_code || null,
+    input.project_name || null,
+    input.company_id,
+    input.company_name || null,
+    input.referenced_order || null,
+    input.region_code || null,
+    input.region_name || null,
+    input.customer_job_number || null,
+    input.usage_code || null,
+    input.usage_name || null,
+    input.pour_method_code || null,
+    input.pour_method_name || null,
+    input.po_number || null,
+    input.order_status ?? 0,
+    input.on_job_date,
+    convertTimeToUtc(input.on_job_date, input.on_job_time, tenantTz),
+    input.job_name || null,
+    input.plant_code || null,
+    input.plant_name || null,
+    input.job_address,
+    input.job_city,
+    input.job_state || null,
+    input.job_zip_code || null,
+    input.job_contact_name,
+    input.job_contact_phone,
+    input.driver_instructions || null,
+    input.know_mix_code ?? false,
+    input.concrete_product_code || null,
+    input.concrete_product_name || null,
+    input.concrete_product_text || null,
+    input.psi || null,
+    input.rock_size || null,
+    input.air_non_air || null,
+    input.fly_ash || null,
+    input.quantity || null,
+    input.truck_spacing || null,
+    input.spacing_type || 'minutes',
+    input.slump || null,
+    input.concrete_notes || null,
+    input.call_back_load || null,
+    input.pumped ?? false,
+    input.pumped ? (input.pump_type || null) : null,
+    input.admixture_product_code || null,
+    input.admixture_product_name || null,
+    input.admixture_notes || null,
+    input.other_product_code || null,
+    input.other_product_name || null,
+    input.other_notes || null,
+    new Date().toISOString(),
+    id,
+  ];
+
+  await pool.query(sql, values);
   return { id };
 }
 
@@ -434,49 +484,61 @@ async function updateOrderRequestStatus(id, status) {
     throw new Error('Invalid status');
   }
 
-  const supabase = getSupabaseAdmin();
-  const { error } = await supabase
-    .from('order_entities')
-    .update({ status, updated_at: new Date().toISOString() })
-    .eq('id', id);
+  const pool = getPool();
+  await pool.query(
+    'UPDATE order_entities SET status = $1, updated_at = $2 WHERE id = $3',
+    [status, new Date().toISOString(), id]
+  );
 
-  if (error) throw new Error(`Failed to update status: ${error.message}`);
   return { id, status };
 }
 
 // Update verification fields
 async function updateOrderVerification(id, data, tenantTz = null) {
-  const supabase = getSupabaseAdmin();
-  const updatePayload = { updated_at: new Date().toISOString() };
+  const pool = getPool();
 
-  if (data.order_number !== undefined) updatePayload.order_number = data.order_number || null;
-  if (data.order_status !== undefined) updatePayload.order_status = data.order_status;
-  if (data.on_job_date !== undefined) updatePayload.on_job_date = data.on_job_date;
+  const setClauses = ['updated_at = $1'];
+  const values = [new Date().toISOString()];
+  let paramIndex = 2;
+
+  if (data.order_number !== undefined) {
+    setClauses.push(`order_number = $${paramIndex}`);
+    values.push(data.order_number || null);
+    paramIndex++;
+  }
+  if (data.order_status !== undefined) {
+    setClauses.push(`order_status = $${paramIndex}`);
+    values.push(data.order_status);
+    paramIndex++;
+  }
+  if (data.on_job_date !== undefined) {
+    setClauses.push(`on_job_date = $${paramIndex}`);
+    values.push(data.on_job_date);
+    paramIndex++;
+  }
   if (data.on_job_time !== undefined) {
-    const dateForConversion = data.on_job_date || updatePayload.on_job_date;
-    updatePayload.on_job_time = convertTimeToUtc(dateForConversion, data.on_job_time, tenantTz);
+    const dateForConversion = data.on_job_date || data.on_job_date;
+    setClauses.push(`on_job_time = $${paramIndex}`);
+    values.push(convertTimeToUtc(dateForConversion, data.on_job_time, tenantTz));
+    paramIndex++;
   }
 
-  const { error } = await supabase
-    .from('order_entities')
-    .update(updatePayload)
-    .eq('id', id);
+  values.push(id);
+  const sql = `UPDATE order_entities SET ${setClauses.join(', ')} WHERE id = $${paramIndex}`;
+  await pool.query(sql, values);
 
-  if (error) throw new Error(`Failed to update verification: ${error.message}`);
   return { id };
 }
 
 // Get messages for an order request
 async function getMessages(orderEntityId, tz = null) {
-  const supabase = getSupabaseAdmin();
-  const { data, error } = await supabase
-    .from('order_entity_messages')
-    .select('*')
-    .eq('order_entity_id', orderEntityId)
-    .order('created_at', { ascending: true });
+  const pool = getPool();
+  const { rows } = await pool.query(
+    'SELECT * FROM order_entity_messages WHERE order_entity_id = $1 ORDER BY created_at ASC',
+    [orderEntityId]
+  );
 
-  if (error) throw new Error(`Failed to fetch messages: ${error.message}`);
-  const messages = data || [];
+  const messages = rows || [];
   if (tz) {
     return messages.map(msg => ({
       ...msg,
@@ -488,30 +550,24 @@ async function getMessages(orderEntityId, tz = null) {
 
 // Send a message
 async function sendMessage(orderEntityId, senderId, messageText, senderRole, tz = null) {
-  const supabase = getSupabaseAdmin();
+  const pool = getPool();
 
   // Fetch sender name server-side
-  const { data: userProfile } = await supabase
-    .from('users')
-    .select('full_name, email')
-    .eq('id', senderId)
-    .single();
-
+  const { rows: userRows } = await pool.query(
+    'SELECT full_name, email FROM users WHERE id = $1',
+    [senderId]
+  );
+  const userProfile = userRows[0] || null;
   const senderName = userProfile?.full_name || userProfile?.email || 'Unknown User';
 
-  const { data, error } = await supabase
-    .from('order_entity_messages')
-    .insert({
-      order_entity_id: orderEntityId,
-      sender_id: senderId,
-      sender_name: senderName,
-      sender_role: senderRole,
-      message_text: messageText.trim(),
-    })
-    .select()
-    .single();
+  const { rows } = await pool.query(
+    `INSERT INTO order_entity_messages (order_entity_id, sender_id, sender_name, sender_role, message_text)
+     VALUES ($1, $2, $3, $4, $5) RETURNING *`,
+    [orderEntityId, senderId, senderName, senderRole, messageText.trim()]
+  );
 
-  if (error) throw new Error(`Failed to send message: ${error.message}`);
+  if (rows.length === 0) throw new Error('Failed to send message');
+  const data = rows[0];
   if (tz) {
     return { ...data, created_at: formatDateTimeTo12h(data.created_at, tz) };
   }
@@ -524,22 +580,20 @@ let formDataCacheTime = 0;
 const FORM_DATA_CACHE_TTL = 5 * 60 * 1000; // 5 minutes
 
 // Batch-fetch helper for large tables
-async function fetchAllBatched(supabase, table, selectFields, filters, orderField, batchSize = 1000) {
+async function fetchAllBatched(pool, sql, params, batchSize = 1000) {
   let all = [];
   let offset = 0;
   let hasMore = true;
 
   while (hasMore) {
-    let query = supabase.from(table).select(selectFields);
-    if (filters) query = filters(query);
-    query = query.order(orderField, { ascending: true }).range(offset, offset + batchSize - 1);
-
-    const { data, error } = await query;
-    if (error) throw new Error(`Failed to fetch ${table}: ${error.message}`);
-    if (data && data.length > 0) {
-      all = all.concat(data);
+    const { rows } = await pool.query(
+      `${sql} LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
+      [...params, batchSize, offset]
+    );
+    if (rows && rows.length > 0) {
+      all = all.concat(rows);
       offset += batchSize;
-      hasMore = data.length === batchSize;
+      hasMore = rows.length === batchSize;
     } else {
       hasMore = false;
     }
@@ -554,47 +608,38 @@ async function getFormData() {
     return formDataCache;
   }
 
-  const supabase = getSupabaseAdmin();
+  const pool = getPool();
 
   // Run ALL 5 fetches in parallel
   const [regions, customers, projects, admixtureRaw, otherRaw] = await Promise.all([
     // 1. Regions (small table - single query)
-    supabase
-      .from('regions')
-      .select('code, description')
-      .order('description', { ascending: true })
-      .then(({ data, error }) => {
-        if (error) throw new Error(`Failed to fetch regions: ${error.message}`);
-        return data || [];
-      }),
+    pool.query('SELECT code, description FROM regions ORDER BY description ASC')
+      .then(({ rows }) => rows || []),
 
     // 2. Customers (large table - batched)
-    fetchAllBatched(supabase, 'customers', 'code, name',
-      (q) => q.or('inactive.is.null,inactive.eq.false'), 'name'),
+    fetchAllBatched(pool,
+      'SELECT code, name FROM customers WHERE (inactive IS NULL OR inactive = false) ORDER BY name ASC',
+      []),
 
     // 3. Projects (large table - batched)
-    fetchAllBatched(supabase, 'projects',
-      'id, code, name, customer_code, customer_name, delivery_addr1, delivery_addr2, delivery_addr3, contact, phone',
-      null, 'name'),
+    fetchAllBatched(pool,
+      'SELECT id, code, name, customer_code, customer_name, delivery_addr1, delivery_addr2, delivery_addr3, contact, phone FROM projects ORDER BY name ASC',
+      []),
 
-    // 4. Admixture products (matches web query exactly - no .order() before limit)
-    supabase
-      .from('order_products')
-      .select('item_code, description')
-      .eq('is_mix', false)
-      .not('item_code', 'is', null)
-      .or('description.ilike.%admix%,description.ilike.%retard%,description.ilike.%mrwra%,description.ilike.%calcium%,description.ilike.%accelerat%')
-      .limit(2000)
-      .then(({ data }) => data || []),
+    // 4. Admixture products (matches web query exactly)
+    pool.query(
+      `SELECT item_code, description FROM order_products
+       WHERE is_mix = false AND item_code IS NOT NULL
+       AND (description ILIKE '%admix%' OR description ILIKE '%retard%' OR description ILIKE '%mrwra%' OR description ILIKE '%calcium%' OR description ILIKE '%accelerat%')
+       LIMIT 2000`
+    ).then(({ rows }) => rows || []),
 
-    // 5. Other products (matches web query exactly - no .order() before limit)
-    supabase
-      .from('order_products')
-      .select('item_code, description')
-      .eq('is_mix', false)
-      .not('item_code', 'is', null)
-      .limit(2000)
-      .then(({ data }) => data || []),
+    // 5. Other products (matches web query exactly)
+    pool.query(
+      `SELECT item_code, description FROM order_products
+       WHERE is_mix = false AND item_code IS NOT NULL
+       LIMIT 2000`
+    ).then(({ rows }) => rows || []),
   ]);
 
   // Deduplicate admixture products by item_code
@@ -639,18 +684,17 @@ async function getOrdersByProjectCode(projectCode) {
     return [];
   }
 
-  const supabase = getSupabaseAdmin();
+  const pool = getPool();
 
-  const { data, error } = await supabase
-    .from('orders')
-    .select('order_id, order_code, customer_code, customer_name, order_date, project_name, delivery_addr1, delivery_addr2, delivery_addr3, ordered_by_name, ordered_by_phone, pricing_plant_code, zone_name')
-    .eq('project_code', projectCode.trim())
-    .order('order_date', { ascending: false })
-    .limit(50);
+  const { rows } = await pool.query(
+    `SELECT order_id, order_code, customer_code, customer_name, order_date, project_name,
+            delivery_addr1, delivery_addr2, delivery_addr3, ordered_by_name, ordered_by_phone,
+            pricing_plant_code, zone_name
+     FROM orders WHERE project_code = $1 ORDER BY order_date DESC LIMIT 50`,
+    [projectCode.trim()]
+  );
 
-  if (error) throw new Error(`Failed to fetch orders by project code: ${error.message}`);
-
-  return data || [];
+  return rows || [];
 }
 
 // Search orders by code (for referenced order dropdown)
@@ -659,21 +703,22 @@ async function searchOrders(searchTerm) {
     return [];
   }
 
-  const supabase = getSupabaseAdmin();
+  const pool = getPool();
   const term = searchTerm.trim();
 
   // Use prefix match for order_code (index-friendly) and contains for customer_name
-  const { data, error } = await supabase
-    .from('orders')
-    .select('order_id, order_code, customer_code, customer_name, order_date, project_name, delivery_addr1, delivery_addr2, delivery_addr3, ordered_by_name, ordered_by_phone, pricing_plant_code, zone_name')
-    .or(`order_code.ilike.${term}%,customer_name.ilike.%${term}%`)
-    .limit(50);
-
-  if (error) throw new Error(`Failed to search orders: ${error.message}`);
+  const { rows } = await pool.query(
+    `SELECT order_id, order_code, customer_code, customer_name, order_date, project_name,
+            delivery_addr1, delivery_addr2, delivery_addr3, ordered_by_name, ordered_by_phone,
+            pricing_plant_code, zone_name
+     FROM orders WHERE order_code ILIKE $1 OR customer_name ILIKE $2
+     LIMIT 50`,
+    [`${term}%`, `%${term}%`]
+  );
 
   // Deduplicate by order_code
   const seen = new Map();
-  (data || []).forEach((o) => {
+  (rows || []).forEach((o) => {
     if (o.order_code && !seen.has(o.order_code)) {
       seen.set(o.order_code, o);
     }
@@ -684,37 +729,49 @@ async function searchOrders(searchTerm) {
 
 // Search mix products
 async function searchProducts(search = '', uniqueOffset = 0, limit = 50) {
-  const supabase = getSupabaseAdmin();
+  const pool = getPool();
   const BATCH_SIZE = 1000;
   const needed = uniqueOffset + limit + 1;
   const seen = new Map();
   let dbOffset = 0;
   let exhausted = false;
 
-  while (seen.size < needed && !exhausted) {
-    let query = supabase
-      .from('order_products')
-      .select('item_code, description, slump')
-      .eq('is_mix', true)
-      .not('item_code', 'is', null);
+  // Build search conditions
+  let searchConditions = '';
+  const searchParams = [];
+  let paramIndex = 1;
 
-    if (search.trim()) {
-      const words = search.trim().split(/\s+/)
-        .map((w) => w.replace(/^[^a-zA-Z0-9]+$/, ''))
-        .filter((w) => w.length > 0);
-      for (const w of words) {
-        query = query.or(`item_code.ilike.%${w}%,description.ilike.%${w}%`);
-      }
+  if (search.trim()) {
+    const words = search.trim().split(/\s+/)
+      .map((w) => w.replace(/^[^a-zA-Z0-9]+$/, ''))
+      .filter((w) => w.length > 0);
+    const wordConditions = words.map((w) => {
+      searchParams.push(`%${w}%`, `%${w}%`);
+      const cond = `(item_code ILIKE $${paramIndex} OR description ILIKE $${paramIndex + 1})`;
+      paramIndex += 2;
+      return cond;
+    });
+    if (wordConditions.length > 0) {
+      searchConditions = ' AND ' + wordConditions.join(' AND ');
+    }
+  }
+
+  while (seen.size < needed && !exhausted) {
+    const sql = `SELECT item_code, description, slump FROM order_products
+      WHERE is_mix = true AND item_code IS NOT NULL${searchConditions}
+      ORDER BY item_code LIMIT $${paramIndex} OFFSET $${paramIndex + 1}`;
+
+    let rows;
+    try {
+      const result = await pool.query(sql, [...searchParams, BATCH_SIZE, dbOffset]);
+      rows = result.rows;
+    } catch (err) {
+      break;
     }
 
-    const { data, error } = await query
-      .order('item_code')
-      .range(dbOffset, dbOffset + BATCH_SIZE - 1);
+    if (!rows || rows.length === 0) { exhausted = true; break; }
 
-    if (error) break;
-    if (!data || data.length === 0) { exhausted = true; break; }
-
-    for (const row of data) {
+    for (const row of rows) {
       if (!row.item_code) continue;
       const desc = row.description || '';
       const label = desc ? `${row.item_code} - ${desc}` : row.item_code;
@@ -724,7 +781,7 @@ async function searchProducts(search = '', uniqueOffset = 0, limit = 50) {
       }
     }
 
-    if (data.length < BATCH_SIZE) { exhausted = true; break; }
+    if (rows.length < BATCH_SIZE) { exhausted = true; break; }
     dbOffset += BATCH_SIZE;
   }
 
@@ -739,17 +796,13 @@ async function searchProducts(search = '', uniqueOffset = 0, limit = 50) {
 async function getRecentOrderEntities(userId) {
   if (!userId) return [];
 
-  const supabase = getSupabaseAdmin();
-  const { data, error } = await supabase
-    .from('order_entities')
-    .select('id, job_name, on_job_date, company_name, company_id')
-    .eq('user_id', userId)
-    .order('created_at', { ascending: false })
-    .limit(20);
+  const pool = getPool();
+  const { rows } = await pool.query(
+    'SELECT id, job_name, on_job_date, company_name, company_id FROM order_entities WHERE user_id = $1 ORDER BY created_at DESC LIMIT 20',
+    [userId]
+  );
 
-  if (error) throw new Error(`Failed to fetch recent order entities: ${error.message}`);
-
-  return (data || []).map((o) => ({
+  return (rows || []).map((o) => ({
     id: o.id,
     display: `OE-${o.id.slice(0, 6).toUpperCase()} — ${o.job_name || o.company_name || o.on_job_date}`,
     company_id: o.company_id,

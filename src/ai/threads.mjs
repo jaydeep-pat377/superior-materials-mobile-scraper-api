@@ -1,68 +1,73 @@
 /**
  * AI Assistant chat-thread persistence (ported from the web app's
  * /api/ai/threads routes). All queries are scoped to the authenticated
- * user's id (the Supabase auth UUID carried in the backend JWT).
+ * user's id (the auth UUID carried in the backend JWT).
  */
 
-import { supabaseServer } from './_supabase.mjs';
+import pool from './_db.mjs';
 
 export async function listThreads(userId) {
-  const { data, error } = await supabaseServer
-    .from('ai_chat_threads')
-    .select('id, title, updated_at, created_at')
-    .eq('user_id', userId)
-    .order('updated_at', { ascending: false })
-    .limit(100);
-  if (error) throw new Error(error.message);
-  return data ?? [];
+  const { rows } = await pool.query(
+    `SELECT id, title, updated_at, created_at
+     FROM ai_chat_threads
+     WHERE user_id = $1
+     ORDER BY updated_at DESC
+     LIMIT 100`,
+    [userId],
+  );
+  return rows;
 }
 
 export async function createThread(userId) {
-  const { data, error } = await supabaseServer
-    .from('ai_chat_threads')
-    .insert({ user_id: userId, messages: [] })
-    .select('id, title, updated_at, created_at')
-    .single();
-  if (error) throw new Error(error.message);
-  return data;
+  const { rows } = await pool.query(
+    `INSERT INTO ai_chat_threads (user_id, messages)
+     VALUES ($1, $2)
+     RETURNING id, title, updated_at, created_at`,
+    [userId, JSON.stringify([])],
+  );
+  return rows[0];
 }
 
 export async function getThread(userId, id) {
-  const { data, error } = await supabaseServer
-    .from('ai_chat_threads')
-    .select('id, title, messages, updated_at, created_at')
-    .eq('id', id)
-    .eq('user_id', userId)
-    .single();
-  if (error) {
-    if (error.code === 'PGRST116') return null; // no row
-    throw new Error(error.message);
-  }
-  return data;
+  const { rows } = await pool.query(
+    `SELECT id, title, messages, updated_at, created_at
+     FROM ai_chat_threads
+     WHERE id = $1 AND user_id = $2`,
+    [id, userId],
+  );
+  return rows[0] || null;
 }
 
 export async function saveThread(userId, id, { messages, title }) {
-  const patch = { updated_at: new Date().toISOString() };
-  if (Array.isArray(messages)) patch.messages = messages;
-  if (typeof title === 'string') patch.title = title;
+  const setClauses = ['updated_at = $3'];
+  const params = [id, userId, new Date().toISOString()];
+  let paramIdx = 4;
 
-  const { data, error } = await supabaseServer
-    .from('ai_chat_threads')
-    .update(patch)
-    .eq('id', id)
-    .eq('user_id', userId)
-    .select('id, title, updated_at')
-    .single();
-  if (error) throw new Error(error.message);
-  return data;
+  if (Array.isArray(messages)) {
+    setClauses.push(`messages = $${paramIdx}`);
+    params.push(JSON.stringify(messages));
+    paramIdx++;
+  }
+  if (typeof title === 'string') {
+    setClauses.push(`title = $${paramIdx}`);
+    params.push(title);
+    paramIdx++;
+  }
+
+  const { rows } = await pool.query(
+    `UPDATE ai_chat_threads
+     SET ${setClauses.join(', ')}
+     WHERE id = $1 AND user_id = $2
+     RETURNING id, title, updated_at`,
+    params,
+  );
+  return rows[0];
 }
 
 export async function deleteThread(userId, id) {
-  const { error } = await supabaseServer
-    .from('ai_chat_threads')
-    .delete()
-    .eq('id', id)
-    .eq('user_id', userId);
-  if (error) throw new Error(error.message);
+  await pool.query(
+    'DELETE FROM ai_chat_threads WHERE id = $1 AND user_id = $2',
+    [id, userId],
+  );
   return { success: true };
 }

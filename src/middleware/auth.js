@@ -1,6 +1,6 @@
 const { verifyAccessToken } = require('../utils/jwtUtils');
 const { executeDirectSQL } = require('../utils/postgresExecutor');
-const { getAuthSupabaseAdmin } = require('../config/authDatabase');
+const { getAuthPool } = require('../config/authDatabase');
 
 // Admin role code - same as web app (/src/lib/admin-check.ts)
 const ADMIN_ROLE_CODE = 'tk-admin';
@@ -181,27 +181,29 @@ async function getAllowedCustomerIdsForUser(userId) {
  * Resolve a UUID user ID to the integer ID used in tenant_users.
  * If the userId is already numeric, returns it as-is.
  */
-async function resolveUserId(supabase, userId) {
+async function resolveUserId(authPool, userId) {
   // If already a number, return directly
   if (typeof userId === 'number' || /^\d+$/.test(userId)) {
     return Number(userId);
   }
 
   // UUID — look up integer id from auth_tenant.users
-  const { data, error } = await supabase
-    .schema('auth_tenant')
-    .from('users')
-    .select('id')
-    .eq('uuid', userId)
-    .is('deleted_at', null)
-    .limit(1);
+  try {
+    const { rows } = await authPool.query(
+      'SELECT id FROM auth_tenant.users WHERE uuid = $1 AND deleted_at IS NULL LIMIT 1',
+      [userId]
+    );
 
-  if (error || !data || data.length === 0) {
+    if (!rows || rows.length === 0) {
+      console.log('[AccessControl] resolveUserId: could not find integer id for UUID:', userId);
+      return null;
+    }
+
+    return rows[0].id;
+  } catch (error) {
     console.log('[AccessControl] resolveUserId: could not find integer id for UUID:', userId, 'error:', error?.message);
     return null;
   }
-
-  return data[0].id;
 }
 
 /**
@@ -214,40 +216,34 @@ const DEFAULT_TIMEZONE = { iana: 'America/Chicago' };
 
 async function getTenantTimezoneForUser(userId) {
   try {
-    const supabase = getAuthSupabaseAdmin();
+    const authPool = getAuthPool();
 
     // Resolve UUID to integer user ID if needed
-    const numericUserId = await resolveUserId(supabase, userId);
+    const numericUserId = await resolveUserId(authPool, userId);
     if (!numericUserId) return DEFAULT_TIMEZONE;
 
     // Step 1: Get tenant_id from tenant_users
-    const { data: tuData, error: tuError } = await supabase
-      .schema('auth_tenant')
-      .from('tenant_users')
-      .select('tenant_id')
-      .eq('user_id', numericUserId)
-      .eq('status', 'active')
-      .limit(1);
+    const { rows: tuRows } = await authPool.query(
+      'SELECT tenant_id FROM auth_tenant.tenant_users WHERE user_id = $1 AND status = $2 LIMIT 1',
+      [numericUserId, 'active']
+    );
 
-    if (tuError || !tuData || tuData.length === 0) {
+    if (!tuRows || tuRows.length === 0) {
       return DEFAULT_TIMEZONE;
     }
 
     // Step 2: Get timezone from tenants
-    const { data: tData, error: tError } = await supabase
-      .schema('auth_tenant')
-      .from('tenants')
-      .select('timezone')
-      .eq('id', tuData[0].tenant_id)
-      .is('deleted_at', null)
-      .limit(1);
+    const { rows: tRows } = await authPool.query(
+      'SELECT timezone FROM auth_tenant.tenants WHERE id = $1 AND deleted_at IS NULL LIMIT 1',
+      [tuRows[0].tenant_id]
+    );
 
-    if (tError || !tData || tData.length === 0) {
+    if (!tRows || tRows.length === 0) {
       return DEFAULT_TIMEZONE;
     }
 
-    if (tData[0].timezone) {
-      const tz = tData[0].timezone;
+    if (tRows[0].timezone) {
+      const tz = tRows[0].timezone;
       // Support both { iana: "America/Chicago" } and plain string "America/Chicago"
       const iana = typeof tz === 'string' ? tz : (tz.iana || null);
       return iana ? { iana } : DEFAULT_TIMEZONE;
@@ -267,44 +263,38 @@ async function getTenantTimezoneForUser(userId) {
  */
 async function getTenantShowRegionForUser(userId) {
   try {
-    const supabase = getAuthSupabaseAdmin();
+    const authPool = getAuthPool();
 
     // Resolve UUID to integer user ID if needed
-    const numericUserId = await resolveUserId(supabase, userId);
+    const numericUserId = await resolveUserId(authPool, userId);
     if (!numericUserId) return false;
 
     // Step 1: Get tenant_id from tenant_users
-    const { data: tuData, error: tuError } = await supabase
-      .schema('auth_tenant')
-      .from('tenant_users')
-      .select('tenant_id')
-      .eq('user_id', numericUserId)
-      .eq('status', 'active')
-      .limit(1);
+    const { rows: tuRows } = await authPool.query(
+      'SELECT tenant_id FROM auth_tenant.tenant_users WHERE user_id = $1 AND status = $2 LIMIT 1',
+      [numericUserId, 'active']
+    );
 
-    if (tuError || !tuData || tuData.length === 0) {
-      console.log('[AccessControl] show_regions: no tenant_user found for userId:', userId, 'error:', tuError?.message);
+    if (!tuRows || tuRows.length === 0) {
+      console.log('[AccessControl] show_regions: no tenant_user found for userId:', userId);
       return false;
     }
 
-    console.log('[AccessControl] show_regions: found tenant_id:', tuData[0].tenant_id, 'for userId:', userId);
+    console.log('[AccessControl] show_regions: found tenant_id:', tuRows[0].tenant_id, 'for userId:', userId);
 
     // Step 2: Get show_regions from tenants
-    const { data: tData, error: tError } = await supabase
-      .schema('auth_tenant')
-      .from('tenants')
-      .select('show_regions')
-      .eq('id', tuData[0].tenant_id)
-      .is('deleted_at', null)
-      .limit(1);
+    const { rows: tRows } = await authPool.query(
+      'SELECT show_regions FROM auth_tenant.tenants WHERE id = $1 AND deleted_at IS NULL LIMIT 1',
+      [tuRows[0].tenant_id]
+    );
 
-    if (tError || !tData || tData.length === 0) {
-      console.log('[AccessControl] show_regions: no tenant found for tenant_id:', tuData[0].tenant_id, 'error:', tError?.message);
+    if (!tRows || tRows.length === 0) {
+      console.log('[AccessControl] show_regions: no tenant found for tenant_id:', tuRows[0].tenant_id);
       return false;
     }
 
-    console.log('[AccessControl] show_regions raw value:', tData[0].show_regions, 'type:', typeof tData[0].show_regions);
-    return tData[0].show_regions === true;
+    console.log('[AccessControl] show_regions raw value:', tRows[0].show_regions, 'type:', typeof tRows[0].show_regions);
+    return tRows[0].show_regions === true;
   } catch (error) {
     console.error('[AccessControl] Error checking show_regions:', error.message);
     return false;
@@ -619,14 +609,13 @@ async function authenticate(req, res, next) {
         if (cachedTz && (Date.now() - cachedTz.ts) < TZ_PREF_CACHE_TTL_MS) {
           if (cachedTz.iana) req.user.timezone = { iana: cachedTz.iana };
         } else {
-          const { getSupabaseAdmin } = require('../config/database');
-          const supabase = getSupabaseAdmin();
-          const { data: prefRow } = await supabase
-            .from('user_preferences')
-            .select('preference_value')
-            .eq('user_id', decoded.id)
-            .eq('preference_key', 'timezone')
-            .maybeSingle();
+          const { getPool } = require('../config/database');
+          const pool = getPool();
+          const { rows: prefRows } = await pool.query(
+            'SELECT preference_value FROM user_preferences WHERE user_id = $1 AND preference_key = $2 LIMIT 1',
+            [decoded.id, 'timezone']
+          );
+          const prefRow = prefRows.length > 0 ? prefRows[0] : null;
 
           let iana = null;
           const pv = prefRow?.preference_value;
@@ -640,12 +629,11 @@ async function authenticate(req, res, next) {
               // Numeric ID — look up iana_code from timezones table
               const tzId = typeof pv === 'number' ? pv : Number(pv);
               if (!isNaN(tzId)) {
-                const { data: tzRow } = await supabase
-                  .from('timezones')
-                  .select('iana_code')
-                  .eq('id', tzId)
-                  .maybeSingle();
-                if (tzRow?.iana_code) iana = tzRow.iana_code;
+                const { rows: tzRows } = await pool.query(
+                  'SELECT iana_code FROM timezones WHERE id = $1 LIMIT 1',
+                  [tzId]
+                );
+                if (tzRows.length > 0 && tzRows[0].iana_code) iana = tzRows[0].iana_code;
               }
             }
           }

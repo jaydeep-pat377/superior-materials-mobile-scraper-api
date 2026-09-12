@@ -9,7 +9,7 @@ require('dotenv').config();
 
 const crypto = require('crypto');
 const notificationService = require('../src/services/notificationService');
-const { getNotificationSupabase } = require('../src/config/notificationDatabase');
+const { getNotificationPool } = require('../src/config/notificationDatabase');
 
 const TARGET_USER_ID = '8dd1b8a3-a794-400d-961b-8a2fa28c2966';
 const TENANT_ID = 37;
@@ -56,30 +56,29 @@ async function run() {
 
   // 2. Insert into notification_queue for in-app history
   try {
-    const supabase = getNotificationSupabase();
+    const pool = getNotificationPool();
 
-    const { error } = await supabase
-      .from('notification_queue')
-      .insert({
-        queue_uuid: crypto.randomUUID(),
-        channel_code: 'push',
-        user_id: TARGET_USER_ID,
-        event_code: EVENT_CODE,
-        event_name: EVENT_CODE.replace(/_/g, ' '),
-        entity_type: 'order',
-        entity_id: ORDER_ID,
-        subject: TITLE,
-        body: BODY,
-        priority: 1,
-        status: 'sent',
-        tenant_id: TENANT_ID,
-      });
+    await pool.query(
+      `INSERT INTO notification_queue
+        (queue_uuid, channel_code, user_id, event_code, event_name, entity_type, entity_id, subject, body, priority, status, tenant_id)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
+      [
+        crypto.randomUUID(),
+        'push',
+        TARGET_USER_ID,
+        EVENT_CODE,
+        EVENT_CODE.replace(/_/g, ' '),
+        'order',
+        ORDER_ID,
+        TITLE,
+        BODY,
+        1,
+        'sent',
+        TENANT_ID,
+      ]
+    );
 
-    if (error) {
-      console.error('  Queue insert error:', error.message);
-    } else {
-      console.log('  Queue record inserted (status: sent)');
-    }
+    console.log('  Queue record inserted (status: sent)');
   } catch (err) {
     console.error('  Queue error:', err.message);
   }

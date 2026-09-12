@@ -1,0 +1,21 @@
+version: 0.2
+
+# CodeBuild spec for the Dolese mobile/API image (dolese-api).
+# Builds the migrated Node API image and pushes it to ECR.
+# Requires (project env vars): AWS_DEFAULT_REGION, ECR_REGISTRY, IMAGE_REPO, IMAGE_TAG.
+# Runs in a privileged CodeBuild environment (docker enabled).
+
+phases:
+  pre_build:
+    commands:
+      - echo "Logging in to ECR $ECR_REGISTRY"
+      - aws ecr get-login-password --region "$AWS_DEFAULT_REGION" | docker login --username AWS --password-stdin "$ECR_REGISTRY"
+  build:
+    commands:
+      - echo "Building $ECR_REGISTRY/$IMAGE_REPO:$IMAGE_TAG"
+      - docker build -t "$ECR_REGISTRY/$IMAGE_REPO:$IMAGE_TAG" .
+  post_build:
+    commands:
+      - echo "Pushing $ECR_REGISTRY/$IMAGE_REPO:$IMAGE_TAG"
+      - docker push "$ECR_REGISTRY/$IMAGE_REPO:$IMAGE_TAG"
+      - echo "Done."

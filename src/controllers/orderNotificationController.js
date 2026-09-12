@@ -1,37 +1,36 @@
 const crypto = require('crypto');
 const notificationService = require('../services/notificationService');
 const notificationPushService = require('../services/notificationPushService');
-const { getNotificationSupabase } = require('../config/notificationDatabase');
+const { getNotificationPool } = require('../config/notificationDatabase');
 
 /**
  * Insert notification into notification_queue for in-app history
  */
 async function insertNotificationQueue({ userId, tenantId, eventCode, entityType, entityId, subject, body, orderCode, orderDate }) {
   try {
-    const supabase = getNotificationSupabase();
+    const pool = getNotificationPool();
 
-    const { error } = await supabase
-      .from('notification_queue')
-      .insert({
-        queue_uuid: crypto.randomUUID(),
-        channel_code: 'push',
-        user_id: userId,
-        event_code: eventCode,
-        event_name: eventCode.replace(/_/g, ' '),
-        entity_type: entityType || 'order',
-        entity_id: entityId || null,
+    await pool.query(
+      `INSERT INTO notification_queue
+        (queue_uuid, channel_code, user_id, event_code, event_name, entity_type, entity_id, subject, body, priority, status, tenant_id, order_code, order_date)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)`,
+      [
+        crypto.randomUUID(),
+        'push',
+        userId,
+        eventCode,
+        eventCode.replace(/_/g, ' '),
+        entityType || 'order',
+        entityId || null,
         subject,
         body,
-        priority: 1,
-        status: 'sent',
-        tenant_id: tenantId || null,
-        order_code: orderCode || null,
-        order_date: orderDate || null,
-      });
-
-    if (error) {
-      console.error('[OrderNotification] Error inserting notification_queue:', error.message);
-    }
+        1,
+        'sent',
+        tenantId || null,
+        orderCode || null,
+        orderDate || null,
+      ]
+    );
   } catch (err) {
     console.error('[OrderNotification] notification_queue insert failed:', err.message);
   }

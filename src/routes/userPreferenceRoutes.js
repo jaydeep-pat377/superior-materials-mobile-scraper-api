@@ -1,7 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const { authenticate, invalidateTzPrefCache } = require('../middleware/auth');
-const { getSupabaseAdmin } = require('../config/database');
+const { getPool } = require('../config/database');
 
 /**
  * @route   GET /api/user-preferences/:key
@@ -17,22 +17,15 @@ router.get('/:key', authenticate, async (req, res) => {
     const userId = req.user.id;
     const { key } = req.params;
 
-    const supabase = getSupabaseAdmin();
-    const { data, error } = await supabase
-      .from('user_preferences')
-      .select('preference_value')
-      .eq('user_id', userId)
-      .eq('preference_key', key)
-      .maybeSingle();
-
-    if (error) {
-      console.error('[UserPreferences] GET error:', error.message);
-      return res.status(500).json({ success: false, message: 'Failed to fetch preference' });
-    }
+    const pool = getPool();
+    const { rows } = await pool.query(
+      'SELECT preference_value FROM user_preferences WHERE user_id = $1 AND preference_key = $2 LIMIT 1',
+      [userId, key]
+    );
 
     return res.status(200).json({
       success: true,
-      data: data ? data.preference_value : null,
+      data: rows.length > 0 ? rows[0].preference_value : null,
     });
   } catch (err) {
     console.error('[UserPreferences] Error:', err.message);
@@ -59,25 +52,21 @@ router.put('/:key', authenticate, async (req, res) => {
       return res.status(400).json({ success: false, message: 'value is required' });
     }
 
-    const supabase = getSupabaseAdmin();
-    const { data, error } = await supabase
-      .from('user_preferences')
-      .upsert({
-        user_id: userId,
-        preference_key: key,
-        preference_value: value,
-        updated_at: new Date().toISOString(),
-      }, {
-        onConflict: 'user_id,preference_key',
-      })
-      .select()
-      .single();
+    const pool = getPool();
+    const { rows } = await pool.query(
+      `INSERT INTO user_preferences (user_id, preference_key, preference_value, updated_at)
+       VALUES ($1, $2, $3, $4)
+       ON CONFLICT (user_id, preference_key) DO UPDATE SET preference_value = $3, updated_at = $4
+       RETURNING *`,
+      [userId, key, JSON.stringify(value), new Date().toISOString()]
+    );
 
-    if (error) {
-      console.error('[UserPreferences] PUT error:', error.message, 'code:', error.code, 'details:', error.details, 'hint:', error.hint);
-      console.error('[UserPreferences] PUT params:', { userId, key, value: typeof value, valueRaw: JSON.stringify(value) });
-      return res.status(500).json({ success: false, message: 'Failed to save preference', error: error.message });
+    if (rows.length === 0) {
+      console.error('[UserPreferences] PUT error: no row returned');
+      return res.status(500).json({ success: false, message: 'Failed to save preference' });
     }
+
+    const data = rows[0];
 
     // Immediately invalidate timezone cache so next request uses new value
     if (key === 'timezone') {

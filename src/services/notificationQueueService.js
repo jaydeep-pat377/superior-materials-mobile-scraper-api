@@ -1,4 +1,4 @@
-const { getNotificationSupabase } = require('../config/notificationDatabase');
+const { getNotificationPool } = require('../config/notificationDatabase');
 
 /**
  * Get notifications for a user filtered by tenant with pagination
@@ -9,27 +9,29 @@ const { getNotificationSupabase } = require('../config/notificationDatabase');
  * @returns {Object} { notifications, total, page, limit, totalPages }
  */
 async function getNotifications(userId, tenantId, page = 1, limit = 50) {
-  const supabase = getNotificationSupabase();
+  const pool = getNotificationPool();
 
-  const from = (page - 1) * limit;
-  const to = from + limit - 1;
+  const offset = (page - 1) * limit;
 
-  const { data, error, count } = await supabase
-    .from('notification_queue')
-    .select('*', { count: 'exact' })
-    .eq('user_id', userId)
-    .eq('tenant_id', tenantId)
-    .order('created_at', { ascending: false })
-    .range(from, to);
+  const [dataResult, countResult] = await Promise.all([
+    pool.query(
+      'SELECT * FROM notification_queue WHERE user_id = $1 AND tenant_id = $2 ORDER BY created_at DESC LIMIT $3 OFFSET $4',
+      [userId, tenantId, limit, offset]
+    ),
+    pool.query(
+      'SELECT COUNT(*) FROM notification_queue WHERE user_id = $1 AND tenant_id = $2',
+      [userId, tenantId]
+    )
+  ]);
 
-  if (error) throw new Error(`Failed to fetch notifications: ${error.message}`);
+  const total = parseInt(countResult.rows[0].count, 10) || 0;
 
   return {
-    notifications: data || [],
-    total: count || 0,
+    notifications: dataResult.rows || [],
+    total,
     page,
     limit,
-    totalPages: Math.ceil((count || 0) / limit)
+    totalPages: Math.ceil(total / limit)
   };
 }
 
@@ -42,30 +44,74 @@ async function getNotifications(userId, tenantId, page = 1, limit = 50) {
  * @param {number} limit
  */
 async function getRecentNotifications(userId, page = 1, limit = 20) {
-  const supabase = getNotificationSupabase();
+  const pool = getNotificationPool();
 
-  const from = (page - 1) * limit;
-  const to = from + limit - 1;
+  const offset = (page - 1) * limit;
 
-  const { data, error, count } = await supabase
-    .from('notification_queue')
-    .select('*', { count: 'exact' })
-    .eq('user_id', userId)
-    .order('created_at', { ascending: false })
-    .range(from, to);
+  const [dataResult, countResult] = await Promise.all([
+    pool.query(
+      'SELECT * FROM notification_queue WHERE user_id = $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3',
+      [userId, limit, offset]
+    ),
+    pool.query(
+      'SELECT COUNT(*) FROM notification_queue WHERE user_id = $1',
+      [userId]
+    )
+  ]);
 
-  if (error) throw new Error(`Failed to fetch notifications: ${error.message}`);
+  const total = parseInt(countResult.rows[0].count, 10) || 0;
 
   return {
-    notifications: data || [],
-    total: count || 0,
+    notifications: dataResult.rows || [],
+    total,
     page,
     limit,
-    totalPages: Math.ceil((count || 0) / limit)
+    totalPages: Math.ceil(total / limit)
   };
+}
+
+/**
+ * Mark a single notification as read by queue_uuid
+ */
+async function markAsRead(queueUuid, userId) {
+  const pool = getNotificationPool();
+  const now = new Date().toISOString();
+
+  const { rows } = await pool.query(
+    `UPDATE notification_queue
+     SET status = 'delivered', delivered_at = $1, updated_at = $1
+     WHERE queue_uuid = $2 AND user_id = $3
+     RETURNING *`,
+    [now, queueUuid, userId]
+  );
+
+  if (!rows || rows.length === 0) {
+    throw new Error('Notification not found');
+  }
+  return rows[0];
+}
+
+/**
+ * Mark all notifications as read for a user in a tenant
+ */
+async function markAllAsRead(userId, tenantId) {
+  const pool = getNotificationPool();
+  const now = new Date().toISOString();
+
+  const { rows } = await pool.query(
+    `UPDATE notification_queue
+     SET status = 'delivered', delivered_at = $1, updated_at = $1
+     WHERE user_id = $2 AND tenant_id = $3 AND status = 'pending'
+     RETURNING id`,
+    [now, userId, tenantId]
+  );
+
+  return { updated: rows?.length || 0 };
 }
 
 module.exports = {
   getNotifications,
-  getRecentNotifications
+  getRecentNotifications,
+  markAsRead,
+  markAllAsRead
 };

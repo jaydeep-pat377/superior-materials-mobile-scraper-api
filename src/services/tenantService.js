@@ -7,7 +7,7 @@
  * - Validate client credentials for code exchange
  */
 
-const { getAuthSupabaseAdmin } = require('../config/authDatabase');
+const { getAuthPool } = require('../config/authDatabase');
 const { decrypt, secureCompare } = require('../utils/encryptionUtils');
 
 // In-memory cache for tenant lookups by subdomain (10-minute TTL)
@@ -30,28 +30,23 @@ async function getTenantBySubdomain(subdomain) {
     return cached.data;
   }
 
-  const supabase = getAuthSupabaseAdmin();
+  const authPool = getAuthPool();
 
-  const { data, error } = await supabase
-    .schema('auth_tenant')
-    .from('tenants')
-    .select('id, uuid, name, subdomain, redirect_url, client_id, status, settings')
-    .eq('subdomain', normalizedSubdomain)
-    .is('deleted_at', null)
-    .limit(1);
+  const { rows } = await authPool.query(
+    `SELECT id, uuid, name, subdomain, redirect_url, client_id, status, settings
+     FROM auth_tenant.tenants
+     WHERE subdomain = $1 AND deleted_at IS NULL
+     LIMIT 1`,
+    [normalizedSubdomain]
+  );
 
-  if (error) {
-    console.log('[TenantService] getTenantBySubdomain error:', error.message);
-    return null;
-  }
-
-  if (!data || data.length === 0) {
+  if (!rows || rows.length === 0) {
     // Cache null results too (prevents repeated DB hits for invalid subdomains)
     _tenantCache.set(normalizedSubdomain, { data: null, timestamp: Date.now() });
     return null;
   }
 
-  const tenant = data[0];
+  const tenant = rows[0];
   const result = {
     id: tenant.id,
     uuid: tenant.uuid,
@@ -73,22 +68,18 @@ async function getTenantBySubdomain(subdomain) {
  * @returns {Object|null} Full tenant data
  */
 async function getTenantById(tenantId) {
-  const supabase = getAuthSupabaseAdmin();
+  const authPool = getAuthPool();
 
-  const { data, error } = await supabase
-    .schema('auth_tenant')
-    .from('tenants')
-    .select('*')
-    .eq('id', tenantId)
-    .is('deleted_at', null)
-    .limit(1);
+  const { rows } = await authPool.query(
+    'SELECT * FROM auth_tenant.tenants WHERE id = $1 AND deleted_at IS NULL LIMIT 1',
+    [tenantId]
+  );
 
-  if (error) {
-    console.log('[TenantService] getTenantById error:', error.message);
+  if (!rows || rows.length === 0) {
     return null;
   }
 
-  return data && data.length > 0 ? data[0] : null;
+  return rows[0];
 }
 
 /**
@@ -97,26 +88,18 @@ async function getTenantById(tenantId) {
  * @returns {Object|null} Tenant data with decrypted secrets
  */
 async function getTenantByClientId(clientId) {
-  const supabase = getAuthSupabaseAdmin();
+  const authPool = getAuthPool();
 
-  const { data, error } = await supabase
-    .schema('auth_tenant')
-    .from('tenants')
-    .select('*')
-    .eq('client_id', clientId)
-    .is('deleted_at', null)
-    .limit(1);
+  const { rows } = await authPool.query(
+    'SELECT * FROM auth_tenant.tenants WHERE client_id = $1 AND deleted_at IS NULL LIMIT 1',
+    [clientId]
+  );
 
-  if (error) {
-    console.log('[TenantService] getTenantByClientId error:', error.message);
+  if (!rows || rows.length === 0) {
     return null;
   }
 
-  if (!data || data.length === 0) {
-    return null;
-  }
-
-  const tenant = data[0];
+  const tenant = rows[0];
 
   // Decrypt sensitive fields
   let decryptedData = { ...tenant };
@@ -208,26 +191,21 @@ async function validateClientCredentials(clientId, clientSecret) {
  * @returns {Object|null} Decrypted Supabase credentials
  */
 async function getTenantSupabaseCredentials(tenantId) {
-  const supabase = getAuthSupabaseAdmin();
+  const authPool = getAuthPool();
 
-  const { data, error } = await supabase
-    .schema('auth_tenant')
-    .from('tenants')
-    .select('supabase_url, supabase_anon_key, supabase_service_key')
-    .eq('id', tenantId)
-    .is('deleted_at', null)
-    .limit(1);
+  const { rows } = await authPool.query(
+    `SELECT supabase_url, supabase_anon_key, supabase_service_key
+     FROM auth_tenant.tenants
+     WHERE id = $1 AND deleted_at IS NULL
+     LIMIT 1`,
+    [tenantId]
+  );
 
-  if (error) {
-    console.log('[TenantService] getTenantSupabaseCredentials error:', error.message);
+  if (!rows || rows.length === 0) {
     return null;
   }
 
-  if (!data || data.length === 0) {
-    return null;
-  }
-
-  const tenant = data[0];
+  const tenant = rows[0];
 
   try {
     return {

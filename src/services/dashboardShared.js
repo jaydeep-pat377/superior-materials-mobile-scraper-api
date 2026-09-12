@@ -5,7 +5,7 @@
  */
 
 const { executeDirectSQL } = require('../utils/postgresExecutor');
-const { getNotificationSupabase } = require('../config/notificationDatabase');
+const { getNotificationPool } = require('../config/notificationDatabase');
 
 /**
  * Build SQL exclusion conditions from exclusion patterns
@@ -351,17 +351,13 @@ function getTimeAgo(dateString) {
  */
 async function getRecentAlerts(userId) {
   try {
-    const supabase = getNotificationSupabase();
-    const { data, error } = await supabase
-      .from('notification_queue')
-      .select('id, subject, body, created_at, status')
-      .eq('user_id', userId)
-      .order('created_at', { ascending: false })
-      .limit(5);
+    const pool = getNotificationPool();
+    const { rows } = await pool.query(
+      'SELECT id, subject, body, created_at, status FROM notification_queue WHERE user_id = $1 ORDER BY created_at DESC LIMIT 5',
+      [userId]
+    );
 
-    if (error) throw error;
-
-    return (data || []).map(a => ({
+    return (rows || []).map(a => ({
       id: a.id,
       title: a.subject || '',
       message: a.body || '',
@@ -382,22 +378,20 @@ async function getRecentAlerts(userId) {
  */
 async function getUnreadNotificationCount(userId) {
   try {
-    const supabase = getNotificationSupabase();
-    const { count, error } = await supabase
-      .from('notification_queue')
-      .select('id', { count: 'exact', head: true })
-      .eq('user_id', userId)
-      .neq('status', 'delivered');
+    const pool = getNotificationPool();
+    const { rows } = await pool.query(
+      'SELECT COUNT(*) FROM notification_queue WHERE user_id = $1 AND status != $2',
+      [userId, 'delivered']
+    );
 
-    if (error) throw error;
-    return count || 0;
+    return parseInt(rows[0].count, 10) || 0;
   } catch (error) {
     return 0;
   }
 }
 
 /**
- * Get recent alerts + unread count in parallel (2 queries to notification Supabase).
+ * Get recent alerts + unread count in parallel (2 queries to notification database).
  * Returns { alerts: Array, unreadCount: number }
  */
 async function getAlertsAndUnreadCount(userId) {

@@ -4,7 +4,7 @@
  * CRUD operations for user-scoped QR scan history.
  */
 
-const { getSupabaseAdmin } = require('../config/database');
+const { getPool } = require('../config/database');
 
 const TABLE = 'scan_history';
 
@@ -15,31 +15,26 @@ const TABLE = 'scan_history';
  * @param {number} limit - records per page (default 20, max 100)
  */
 async function getHistory(userId, page = 1, limit = 20) {
-  const supabase = getSupabaseAdmin();
+  const pool = getPool();
   const pageNum = Math.max(1, parseInt(page, 10) || 1);
   const limitNum = Math.min(Math.max(1, parseInt(limit, 10) || 20), 100);
   const offset = (pageNum - 1) * limitNum;
 
   // Single query: fetch paginated records + exact total count
-  const { data, count, error } = await supabase
-    .from(TABLE)
-    .select('*', { count: 'exact' })
-    .eq('user_id', userId)
-    .order('timestamp', { ascending: false })
-    .range(offset, offset + limitNum - 1);
+  const { rows } = await pool.query(
+    `SELECT *, COUNT(*) OVER() AS _total_count FROM ${TABLE} WHERE user_id = $1 ORDER BY timestamp DESC LIMIT $2 OFFSET $3`,
+    [userId, limitNum, offset]
+  );
 
-  console.log('[ScanHistory] getHistory — userId:', userId, '| records:', data?.length, '| count:', count, '| page:', pageNum, '| offset:', offset, '| limit:', limitNum, '| error:', error?.message);
+  const total = rows.length > 0 ? parseInt(rows[0]._total_count, 10) : 0;
+  const data = rows.map(({ _total_count, ...rest }) => rest);
 
-  if (error) {
-    console.error('[ScanHistory] getHistory error:', error.message);
-    throw new Error('Failed to fetch scan history');
-  }
+  console.log('[ScanHistory] getHistory — userId:', userId, '| records:', data.length, '| count:', total, '| page:', pageNum, '| offset:', offset, '| limit:', limitNum);
 
-  const total = count ?? 0;
   const totalPages = Math.ceil(total / limitNum);
 
   return {
-    records: (data || []).map(mapRowToRecord),
+    records: data.map(mapRowToRecord),
     pagination: {
       page: pageNum,
       limit: limitNum,
@@ -55,71 +50,66 @@ async function getHistory(userId, page = 1, limit = 20) {
  * Save a new scan record.
  */
 async function saveScan(userId, record) {
-  const supabase = getSupabaseAdmin();
+  const pool = getPool();
 
-  const row = {
-    user_id: userId,
-    scan_id: record.id,
-    data: record.data,
-    type: record.type || 'qr',
-    timestamp: record.timestamp,
-    label: record.label || null,
-    verified: record.verified || null,
-    tk_data: record.tkData || null,
-    api_data: record.apiData || null,
-  };
+  const { rows } = await pool.query(
+    `INSERT INTO ${TABLE} (user_id, scan_id, data, type, timestamp, label, verified, tk_data, api_data)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+     ON CONFLICT (user_id, scan_id) DO UPDATE SET
+       data = EXCLUDED.data,
+       type = EXCLUDED.type,
+       timestamp = EXCLUDED.timestamp,
+       label = EXCLUDED.label,
+       verified = EXCLUDED.verified,
+       tk_data = EXCLUDED.tk_data,
+       api_data = EXCLUDED.api_data
+     RETURNING *`,
+    [
+      userId,
+      record.id,
+      record.data,
+      record.type || 'qr',
+      record.timestamp,
+      record.label || null,
+      record.verified || null,
+      record.tkData || null,
+      record.apiData || null,
+    ]
+  );
 
-  const { data, error } = await supabase
-    .from(TABLE)
-    .upsert(row, { onConflict: 'user_id,scan_id' })
-    .select()
-    .single();
-
-  if (error) {
-    console.error('[ScanHistory] saveScan error:', error.message);
+  if (rows.length === 0) {
     throw new Error('Failed to save scan record');
   }
 
-  return mapRowToRecord(data);
+  return mapRowToRecord(rows[0]);
 }
 
 /**
  * Delete a single scan record by client scan_id.
  */
 async function deleteScan(userId, scanId) {
-  const supabase = getSupabaseAdmin();
+  const pool = getPool();
 
-  const { error, count } = await supabase
-    .from(TABLE)
-    .delete()
-    .eq('user_id', userId)
-    .eq('scan_id', scanId);
+  const result = await pool.query(
+    `DELETE FROM ${TABLE} WHERE user_id = $1 AND scan_id = $2`,
+    [userId, scanId]
+  );
 
-  if (error) {
-    console.error('[ScanHistory] deleteScan error:', error.message);
-    throw new Error('Failed to delete scan record');
-  }
-
-  return { deleted: count || 1 };
+  return { deleted: result.rowCount || 1 };
 }
 
 /**
  * Clear all scan history for a user.
  */
 async function clearHistory(userId) {
-  const supabase = getSupabaseAdmin();
+  const pool = getPool();
 
-  const { error, count } = await supabase
-    .from(TABLE)
-    .delete()
-    .eq('user_id', userId);
+  const result = await pool.query(
+    `DELETE FROM ${TABLE} WHERE user_id = $1`,
+    [userId]
+  );
 
-  if (error) {
-    console.error('[ScanHistory] clearHistory error:', error.message);
-    throw new Error('Failed to clear scan history');
-  }
-
-  return { deleted: count || 0 };
+  return { deleted: result.rowCount || 0 };
 }
 
 /**

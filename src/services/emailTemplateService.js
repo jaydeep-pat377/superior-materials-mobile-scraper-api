@@ -1,4 +1,4 @@
-const { getSupabaseAdmin } = require('../config/database');
+const { getPool } = require('../config/database');
 
 // =============================================================================
 // Static default template definitions
@@ -50,69 +50,63 @@ const DEFAULT_TEMPLATES = [
 
 // Fetch all email templates ordered by template_key
 async function getEmailTemplates() {
-  const supabase = getSupabaseAdmin();
-  const { data, error } = await supabase
-    .from('email_templates')
-    .select('*')
-    .order('template_key', { ascending: true });
-
-  if (error) throw new Error(`Failed to fetch email templates: ${error.message}`);
-  return data || [];
+  const pool = getPool();
+  const { rows } = await pool.query(
+    'SELECT * FROM email_templates ORDER BY template_key ASC'
+  );
+  return rows || [];
 }
 
 // Fetch a single email template by id
 async function getEmailTemplateById(id) {
-  const supabase = getSupabaseAdmin();
-  const { data, error } = await supabase
-    .from('email_templates')
-    .select('*')
-    .eq('id', id)
-    .single();
+  const pool = getPool();
+  const { rows } = await pool.query(
+    'SELECT * FROM email_templates WHERE id = $1',
+    [id]
+  );
 
-  if (error) throw new Error(`Email template not found: ${error.message}`);
-  return data;
+  if (rows.length === 0) throw new Error('Email template not found');
+  return rows[0];
 }
 
 // Fetch an active email template by template_key
 async function getEmailTemplateByKey(templateKey) {
-  const supabase = getSupabaseAdmin();
-  const { data, error } = await supabase
-    .from('email_templates')
-    .select('*')
-    .eq('template_key', templateKey)
-    .eq('is_active', true)
-    .single();
+  const pool = getPool();
+  const { rows } = await pool.query(
+    'SELECT * FROM email_templates WHERE template_key = $1 AND is_active = true',
+    [templateKey]
+  );
 
-  if (error) throw new Error(`Email template not found for key "${templateKey}": ${error.message}`);
-  return data;
+  if (rows.length === 0) throw new Error(`Email template not found for key "${templateKey}"`);
+  return rows[0];
 }
 
 // Create a new email template
 async function createEmailTemplate(input) {
-  const supabase = getSupabaseAdmin();
-  const { data, error } = await supabase
-    .from('email_templates')
-    .insert({
-      template_key: input.template_key,
-      name: input.name,
-      subject: input.subject,
-      body_content: input.body_content || '',
-      font_family: input.font_family || 'Arial, Helvetica, sans-serif',
-      font_size: input.font_size || '14px',
-      footer_text: input.footer_text || 'This is an automated notification...',
-      is_active: input.is_active !== undefined ? input.is_active : true,
-      tenant_id: input.tenant_id || null,
-    })
-    .select()
-    .single();
+  const pool = getPool();
+  const { rows } = await pool.query(
+    `INSERT INTO email_templates (template_key, name, subject, body_content, font_family, font_size, footer_text, is_active, tenant_id)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+     RETURNING *`,
+    [
+      input.template_key,
+      input.name,
+      input.subject,
+      input.body_content || '',
+      input.font_family || 'Arial, Helvetica, sans-serif',
+      input.font_size || '14px',
+      input.footer_text || 'This is an automated notification...',
+      input.is_active !== undefined ? input.is_active : true,
+      input.tenant_id || null,
+    ]
+  );
 
-  if (error) throw new Error(`Failed to create email template: ${error.message}`);
-  return data;
+  return rows[0];
 }
 
 // Update an existing email template
 async function updateEmailTemplate(id, input) {
-  const supabase = getSupabaseAdmin();
+  const pool = getPool();
 
   const updatePayload = { updated_at: new Date().toISOString() };
 
@@ -126,26 +120,23 @@ async function updateEmailTemplate(id, input) {
   if (input.is_active !== undefined) updatePayload.is_active = input.is_active;
   if (input.tenant_id !== undefined) updatePayload.tenant_id = input.tenant_id;
 
-  const { data, error } = await supabase
-    .from('email_templates')
-    .update(updatePayload)
-    .eq('id', id)
-    .select()
-    .single();
+  const keys = Object.keys(updatePayload);
+  const values = Object.values(updatePayload);
+  const setClauses = keys.map((key, i) => `${key} = $${i + 1}`).join(', ');
 
-  if (error) throw new Error(`Failed to update email template: ${error.message}`);
-  return data;
+  const { rows } = await pool.query(
+    `UPDATE email_templates SET ${setClauses} WHERE id = $${keys.length + 1} RETURNING *`,
+    [...values, id]
+  );
+
+  if (rows.length === 0) throw new Error('Failed to update email template: not found');
+  return rows[0];
 }
 
 // Delete an email template by id
 async function deleteEmailTemplate(id) {
-  const supabase = getSupabaseAdmin();
-  const { error } = await supabase
-    .from('email_templates')
-    .delete()
-    .eq('id', id);
-
-  if (error) throw new Error(`Failed to delete email template: ${error.message}`);
+  const pool = getPool();
+  await pool.query('DELETE FROM email_templates WHERE id = $1', [id]);
   return { id };
 }
 

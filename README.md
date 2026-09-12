@@ -15,8 +15,7 @@ A unified Node.js Express API combining Mobile Backend and Scraper API functiona
 - **Data Validation**: Comprehensive validation with detailed error reporting
 - **Order Comparison**: Automatic comparison with system database
 - **Email Notifications**: Comparison report emails with HTML formatting
-- **Storage**: Supabase Storage for JSON file storage
-- **Database**: PostgreSQL for tracking imports and comparisons
+- **Database**: PostgreSQL for all data storage, tracking imports and comparisons
 - **API Documentation**: Swagger/OpenAPI documentation
 
 ## Prerequisites
@@ -24,8 +23,7 @@ A unified Node.js Express API combining Mobile Backend and Scraper API functiona
 Before setting up the project, ensure you have:
 
 - **Node.js 18+** installed on your system
-- **Supabase account** with a project created
-- **PostgreSQL database** (can be Supabase PostgreSQL) - Optional for scraper features
+- **PostgreSQL database** for application data
 - **Firebase project** with FCM enabled - Required for push notifications
 - **SMTP server** credentials (optional, for email notifications)
 
@@ -43,10 +41,10 @@ Create a `.env` file in the root directory and configure the following variables
 
 #### Required Variables
 
-**Supabase Configuration:**
-- `SUPABASE_URL` - Your Supabase project URL
-- `SUPABASE_ANON_KEY` - Supabase anonymous key (for mobile backend)
-- `SUPABASE_SERVICE_KEY` - Supabase service role key (for scraper storage features)
+**Database Configuration:**
+- `DATABASE_URL` - Main PostgreSQL connection string
+- `AUTH_DATABASE_URL` - Auth database connection string (auth_tenant schema)
+- `NOTIFICATION_DATABASE_URL` - Notification database connection string
 
 **JWT Configuration:**
 - `JWT_SECRET` - Secret key for access tokens (generate a secure random key)
@@ -62,7 +60,6 @@ Create a `.env` file in the root directory and configure the following variables
 - `CORS_ORIGIN` - CORS allowed origin (default: '*')
 
 **For Scraper Features (Optional):**
-- `DATABASE_URL` - PostgreSQL connection string (format: `postgresql://user:password@host:port/database`)
 - `SCRAPER_API_KEY` - API key for scraper authentication (generate a secure random key)
 
 **Email Configuration (Optional):**
@@ -177,20 +174,6 @@ x-scraper-api-key: <your-api-key>
 
 ## Configuration Details
 
-### Supabase Setup
-
-1. Create a Supabase project at https://supabase.com
-2. Go to Settings > API to find your project URL and keys
-3. For scraper features, create a storage bucket named `scraped-orders`
-4. Set the bucket to public or configure appropriate access policies
-
-### Firebase Setup
-
-1. Create a Firebase project at https://firebase.google.com
-2. Enable Cloud Messaging (FCM)
-3. Generate a service account key
-4. Download the JSON file and place it at: `src/config/truckast-app-firebase-adminsdk-fbsvc-9c40fa6a9f.json`
-
 ### Database Connection
 
 The `DATABASE_URL` should be in the following format:
@@ -199,8 +182,12 @@ The `DATABASE_URL` should be in the following format:
 postgresql://username:password@host:port/database
 ```
 
-For Supabase PostgreSQL, you can find the connection string in:
-- Supabase Dashboard > Settings > Database > Connection string > URI
+### Firebase Setup
+
+1. Create a Firebase project at https://firebase.google.com
+2. Enable Cloud Messaging (FCM)
+3. Generate a service account key
+4. Download the JSON file and place it at: `src/config/truckast-app-firebase-adminsdk-fbsvc-9c40fa6a9f.json`
 
 ### Email Configuration
 
@@ -311,12 +298,6 @@ Configure your load balancer to use:
 - Verify your `DATABASE_URL` is correct
 - Check if your database is accessible from your server
 - Ensure database credentials are correct
-- Note: Database is optional for scraper features - API will continue without it
-
-**Supabase Storage Errors**
-- Verify `SUPABASE_URL` and `SUPABASE_SERVICE_KEY` are correct
-- Check if the storage bucket exists and has proper permissions
-- Ensure the service role key has storage access
 
 **Firebase Errors**
 - Verify the service account JSON file is in the correct location
@@ -348,7 +329,9 @@ Configure your load balancer to use:
 ├── package.json           # Dependencies and scripts
 ├── src/
 │   ├── config/            # Configuration files
-│   │   ├── database.js        # Supabase configuration
+│   │   ├── database.js        # PostgreSQL pool configuration
+│   │   ├── authDatabase.js    # Auth database pool (auth_tenant schema)
+│   │   ├── notificationDatabase.js # Notification database pool
 │   │   ├── Firebase.js        # Firebase Admin SDK
 │   │   ├── jwt.js             # JWT configuration
 │   │   ├── swaggerScraper.js  # Swagger/OpenAPI config for Scraper API
@@ -374,12 +357,11 @@ Configure your load balancer to use:
 │   │   ├── orderComparisonService.js
 │   │   └── database/
 │   │       ├── postgresClient.js
-│   │       ├── supabaseClient.js
+│   │       ├── storageClient.js
 │   │       ├── scrapedOrderDatabaseService.js
 │   │       └── comparisonDatabaseService.js
 │   └── utils/              # Utility functions
 │       ├── jwtUtils.js
-│       ├── supabaseHelper.js
 │       ├── postgresExecutor.js
 │       └── scrapedOrderValidation.js
 └── README.md               # This file
@@ -396,4 +378,3 @@ For issues or questions:
 ## License
 
 ISC
-

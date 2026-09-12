@@ -49,54 +49,32 @@ app.use((req, res, next) => {
 // Swagger Documentation
 // =============================================================================
 
-// Helper to create spec with dynamic server URL based on request protocol.
-// This prevents mixed-content errors when Swagger UI is accessed over HTTPS
-// but the static spec has an HTTP server URL.
-// Resolution order: API_BASE_URL env var → X-Forwarded-Proto header →
-// forced HTTPS for any non-localhost host → req.protocol fallback.
-const resolveServerUrl = (req) => {
-  if (process.env.API_BASE_URL) return process.env.API_BASE_URL;
-
-  const host = req.get('host') || 'localhost';
-  const isLocal = /^(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$/i.test(host);
-
-  const fwd = req.get('x-forwarded-proto');
-  let protocol;
-  if (fwd) {
-    protocol = fwd.split(',')[0].trim();
-  } else if (!isLocal) {
-    protocol = 'https';
-  } else {
-    protocol = req.protocol;
-  }
-
-  return `${protocol}://${host}`;
-};
-
-const createDynamicSpec = (baseSpec, req) => ({
+// Helper to create spec with a RELATIVE server URL so Swagger UI "Try it out"
+// always targets the same origin (and scheme) the docs page is served from.
+// Using an absolute `${req.protocol}://...` breaks behind a TLS-terminating proxy
+// (Cloudflare/ALB): the pod receives the request over HTTP internally, so
+// req.protocol is "http", producing an http:// URL that an HTTPS docs page is
+// blocked from calling (mixed content → "Failed to fetch"). A relative "/" is
+// resolved by the browser against the current page origin, so it is correct over
+// http locally and https in every proxied environment.
+const createDynamicSpec = (baseSpec, _req) => ({
   ...baseSpec,
   servers: [
     {
-      url: resolveServerUrl(req),
+      url: '/',
       description: process.env.NODE_ENV === 'production' ? 'Production Server' : 'Development Server'
     }
   ]
 });
 
-// Middleware to set req.swaggerDoc dynamically (swagger-ui-express checks this)
+// Middleware to set req.swaggerDoc dynamically (swagger-ui-express checks this).
+// Also mark the docs (HTML + swagger-ui-init.js + spec) as non-cacheable so a CDN
+// like Cloudflare does not serve a stale docs bundle after a deploy.
 const dynamicSwaggerDoc = (baseSpec) => (req, res, next) => {
+  res.set('Cache-Control', 'no-store, must-revalidate');
   req.swaggerDoc = createDynamicSpec(baseSpec, req);
   next();
 };
-
-// Never let a CDN/proxy (e.g. Cloudflare) cache the Swagger UI bootstrap or the
-// dynamic spec — a cached http server URL breaks "Try it out" over HTTPS.
-app.use(['/scraper-api-docs', '/mobile-api-docs', '/scraper-api-docs.json', '/mobile-api-docs.json'], (req, res, next) => {
-  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
-  res.setHeader('Pragma', 'no-cache');
-  res.setHeader('Expires', '0');
-  next();
-});
 
 // Create separate routers for each swagger docs to avoid serve middleware conflicts
 const scraperDocsRouter = express.Router();
@@ -155,6 +133,9 @@ app.get('/.well-known/assetlinks.json', (req, res) => {
 // Serve public PDF documents (NRMCA CIP guides) for mobile clients
 app.use('/pdfs', express.static(path.join(__dirname, 'public', 'pdfs')));
 
+// Serve uploaded files (avatars, etc.)
+app.use('/uploads', express.static(path.join(__dirname, 'public', 'uploads')));
+
 // Explicit PDF endpoint as fallback (in case express.static fails on deployed server)
 app.get('/api/pdfs/:filename', (req, res) => {
   const allowedFiles = [
@@ -187,7 +168,6 @@ app.use('/api/auth', require('./src/routes/authRoutes'));
 app.use('/api/users', require('./src/routes/userRoutes'));
 app.use('/api/notifications', require('./src/routes/notificationRoutes'));
 app.use('/api/orders', require('./src/routes/orderRoutes'));
-app.use('/api/dashboard', require('./src/routes/dashboardRoutes'));
 app.use('/api/new-dashboard', require('./src/routes/newDashboardRoutes'));
 app.use('/api', require('./src/routes/scrapedOrderRoutes'));
 app.use('/api/queue', require('./src/routes/queueRoutes'));
@@ -204,6 +184,10 @@ app.use('/api/qr', require('./src/routes/qrRoutes'));
 
 // Mobile Federated Authentication Routes
 app.use('/api/auth/mobile', require('./src/routes/mobileAuthRoutes'));
+
+// Federated auth alias — lets the mobile app use this backend as FEDERATED_AUTH_URL
+// so auth codes are created and exchanged against the same database.
+app.post('/api/federated-auth/login', require('./src/controllers/mobileAuthController').login);
 app.use('/api/tenant', require('./src/routes/tenantRoutes'));
 app.use('/api/scan-history', require('./src/routes/scanHistoryRoutes'));
 
@@ -214,6 +198,10 @@ app.use('/api/user-preferences', require('./src/routes/userPreferenceRoutes'));
 app.use('/api/timezones', require('./src/routes/timezoneRoutes'));
 
 app.use('/api/short-urls', require('./src/routes/shortUrlRoutes'));
+
+// Daily Intelligence
+app.use('/api/daily-intelligence', require('./src/routes/dailyIntelligenceRoutes'));
+app.use('/daily-intelligence', require('./src/routes/dailyIntelligenceRoutes'));
 
 // Root route
 app.get('/', (req, res) => {
@@ -249,7 +237,7 @@ app.get('/', (req, res) => {
           updateProfile: 'PUT /api/users/profile'
         },
         dashboard: {
-          home: 'GET /api/dashboard'
+          home: 'GET /api/new-dashboard'
         },
         notifications: {
           send: 'POST /api/notifications/send',

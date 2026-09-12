@@ -6,7 +6,7 @@
  * row for that user. Fails open to defaults; env vars are the key fallback.
  */
 
-import { supabaseServer } from './_supabase.mjs';
+import pool from './_db.mjs';
 import { encrypt, decrypt } from './encryption.mjs';
 import { MODELS, DEFAULT_MODEL_ID } from './models.mjs';
 
@@ -33,15 +33,15 @@ export function defaultAiSettings() {
 export async function getAiSettings(userId) {
   if (!userId) return defaultAiSettings();
   try {
-    const { data, error } = await supabaseServer
-      .from('ai_settings')
-      .select(
-        `enabled_model_ids, default_model_id, monthly_allotment, bonus_tokens,
-         enforce_token_limit, token_period_start, updated_at`,
-      )
-      .eq('user_id', userId)
-      .maybeSingle();
-    if (error || !data) return defaultAiSettings();
+    const { rows } = await pool.query(
+      `SELECT enabled_model_ids, default_model_id, monthly_allotment, bonus_tokens,
+              enforce_token_limit, token_period_start, updated_at
+       FROM ai_settings
+       WHERE user_id = $1`,
+      [userId],
+    );
+    const data = rows[0] || null;
+    if (!data) return defaultAiSettings();
     const enabled =
       Array.isArray(data.enabled_model_ids) && data.enabled_model_ids.length > 0
         ? data.enabled_model_ids
@@ -63,16 +63,14 @@ export async function getAiSettings(userId) {
 async function readProviderKeysFromDb(userId) {
   if (!userId) return null;
   try {
-    const { data, error } = await supabaseServer
-      .from('ai_settings')
-      .select(
-        `google_api_key, anthropic_api_key, copilot_api_key,
-         azure_resource_name, azure_deployment`,
-      )
-      .eq('user_id', userId)
-      .maybeSingle();
-    if (error || !data) return null;
-    return data;
+    const { rows } = await pool.query(
+      `SELECT google_api_key, anthropic_api_key, copilot_api_key,
+              azure_resource_name, azure_deployment
+       FROM ai_settings
+       WHERE user_id = $1`,
+      [userId],
+    );
+    return rows[0] || null;
   } catch {
     return null;
   }
@@ -125,12 +123,13 @@ export async function getMonthToDateTokens() {
   try {
     const now = new Date();
     const monthStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1)).toISOString();
-    const { data, error } = await supabaseServer
-      .from('ai_token_usage')
-      .select('total_tokens')
-      .gte('created_at', monthStart);
-    if (error || !data) return 0;
-    return data.reduce((sum, row) => sum + (Number(row.total_tokens) || 0), 0);
+    const { rows } = await pool.query(
+      `SELECT COALESCE(SUM(total_tokens), 0) AS total
+       FROM ai_token_usage
+       WHERE created_at >= $1`,
+      [monthStart],
+    );
+    return Number(rows[0]?.total) || 0;
   } catch {
     return 0;
   }
@@ -143,10 +142,12 @@ export async function getTokenBankStatus(userId) {
   let bonusTokens = settings.bonusTokens;
   if (userId && settings.tokenPeriodStart < currentPeriod) {
     bonusTokens = 0;
-    void supabaseServer
-      .from('ai_settings')
-      .update({ bonus_tokens: 0, token_period_start: currentPeriod })
-      .eq('user_id', userId);
+    pool.query(
+      'UPDATE ai_settings SET bonus_tokens = 0, token_period_start = $1 WHERE user_id = $2',
+      [currentPeriod, userId],
+    ).catch((e) => {
+      console.warn('[ai_settings] period reset failed:', e.message);
+    });
   }
   if (settings.monthlyAllotment == null) {
     return {
@@ -195,11 +196,11 @@ export async function updateAiSettings(userId, input = {}) {
     }
     if (input.addBonusTokens && input.addBonusTokens > 0) {
       const currentPeriod = currentPeriodStart();
-      const { data } = await supabaseServer
-        .from('ai_settings')
-        .select('bonus_tokens, token_period_start')
-        .eq('user_id', userId)
-        .maybeSingle();
+      const { rows: bonusRows } = await pool.query(
+        'SELECT bonus_tokens, token_period_start FROM ai_settings WHERE user_id = $1',
+        [userId],
+      );
+      const data = bonusRows[0] || null;
       const stale = !data?.token_period_start || String(data.token_period_start).slice(0, 10) < currentPeriod;
       const base = stale ? 0 : Number(data?.bonus_tokens) || 0;
       updates.bonus_tokens = base + Math.floor(input.addBonusTokens);
@@ -226,18 +227,30 @@ export async function updateAiSettings(userId, input = {}) {
       }
     }
 
-    const { error } = await supabaseServer
-      .from('ai_settings')
-      .upsert({ user_id: userId, ...updates, updated_at: new Date().toISOString() }, { onConflict: 'user_id' });
-    if (error) {
-      if (error.code === '23503' || /foreign key/i.test(error.message || '')) {
+    const allFields = { user_id: userId, ...updates, updated_at: new Date().toISOString() };
+    const cols = Object.keys(allFields);
+    const vals = Object.values(allFields);
+    const placeholders = cols.map((_, i) => `$${i + 1}`).join(', ');
+    const updateSet = cols
+      .filter((c) => c !== 'user_id')
+      .map((c) => `"${c}" = EXCLUDED."${c}"`)
+      .join(', ');
+    try {
+      await pool.query(
+        `INSERT INTO ai_settings (${cols.map((c) => `"${c}"`).join(', ')})
+         VALUES (${placeholders})
+         ON CONFLICT (user_id) DO UPDATE SET ${updateSet}`,
+        vals,
+      );
+    } catch (err) {
+      if (err.code === '23503' || /foreign key/i.test(err.message || '')) {
         return {
           success: false,
           error:
             'Your account is not fully provisioned for AI settings (auth user not found). Please contact an administrator.',
         };
       }
-      return { success: false, error: error.message };
+      return { success: false, error: err.message };
     }
     return { success: true };
   } catch (e) {

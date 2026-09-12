@@ -1,5 +1,5 @@
-const { getSupabase, getSupabaseAdmin } = require('../config/database');
-const { uploadAvatarToStorage, deleteAvatarFromStorage, AVATARS_BUCKET } = require('./database/supabaseClient');
+const { getPool } = require('../config/database');
+const { uploadAvatarToStorage, deleteAvatarFromStorage, AVATARS_BUCKET } = require('./database/storageClient');
 
 // In-memory user profile cache (2-minute TTL)
 // getUserProfile is called on every authenticated request via dashboard/controllers
@@ -21,27 +21,14 @@ function _invalidateProfileCache(userId) {
 }
 
 /**
- * Get user email from auth.users via Supabase Auth (fallback if not in JWT)
+ * Get user email from auth database (fallback if not in JWT)
  * @param {string} userId - User ID (UUID)
  * @returns {string|null} User email
  */
 async function getUserEmailFromAuth(userId) {
   try {
-    // Use admin client for auth admin operations
-    const supabase = getSupabaseAdmin();
-    
-    // Try using admin API (requires service role key)
-    try {
-      const { data: { user }, error } = await supabase.auth.admin.getUserById(userId);
-      if (!error && user && user.email) {
-        return user.email;
-      }
-    } catch (adminError) {
-      // Admin API not available, continue to fallback
-      console.warn('Admin API not available:', adminError.message);
-    }
-    
-    // Fallback: The email should come from JWT token in most cases
+    // The email should come from JWT token in most cases.
+    // With central auth, there's no admin API to call.
     return null;
   } catch (error) {
     console.warn('Could not fetch user email from auth:', error.message);
@@ -57,74 +44,58 @@ async function getUserEmailFromAuth(userId) {
  */
 async function createUserProfile(userId, email) {
   try {
-    // Use admin client to bypass RLS policies for user creation
-    const supabase = getSupabaseAdmin();
-    
+    const pool = getPool();
+
     // First, check if user already exists (race condition protection)
-    const { data: existingUser } = await supabase
-      .from('users')
-      .select('*')
-      .eq('id', userId)
-      .single();
+    const { rows: existingRows } = await pool.query(
+      'SELECT * FROM users WHERE id = $1',
+      [userId]
+    );
 
     // If user already exists, return it
-    if (existingUser) {
-      return existingUser;
+    if (existingRows.length > 0) {
+      return existingRows[0];
     }
-    
-    const newUser = {
-      id: userId,
-      email: email || null,
-      full_name: null,
-      active: false,
-      created_at: new Date().toISOString(),
-      updated_at: new Date().toISOString(),
-      invitation_status: null,
-      invitation_sent_at: null,
-      invitation_token: null,
-      last_login_at: null,
-      password_reset_at: null,
-      title: null,
-      phone_number: null,
-      phone_country_code: null
-    };
 
-    const { data, error } = await supabase
-      .from('users')
-      .insert(newUser)
-      .select()
-      .single();
+    const now = new Date().toISOString();
 
-    if (error) {
+    try {
+      const { rows } = await pool.query(
+        `INSERT INTO users (id, email, full_name, active, created_at, updated_at,
+          invitation_status, invitation_sent_at, invitation_token, last_login_at,
+          password_reset_at, title, phone_number, phone_country_code)
+         VALUES ($1, $2, NULL, false, $3, $3, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL)
+         RETURNING *`,
+        [userId, email || null, now]
+      );
+
+      return rows[0];
+    } catch (insertError) {
       // If duplicate key error, user was created between check and insert - fetch it
-      if (error.code === '23505' || error.message.includes('duplicate key') || error.message.includes('unique constraint')) {
+      if (insertError.code === '23505' || (insertError.message && (insertError.message.includes('duplicate key') || insertError.message.includes('unique constraint')))) {
         // Try by ID first, then by email (email unique constraint means another ID has this email)
-        const { data: existingById } = await supabase
-          .from('users')
-          .select('*')
-          .eq('id', userId)
-          .single();
+        const { rows: existingById } = await pool.query(
+          'SELECT * FROM users WHERE id = $1',
+          [userId]
+        );
 
-        if (existingById) {
-          return existingById;
+        if (existingById.length > 0) {
+          return existingById[0];
         }
 
         if (email) {
-          const { data: existingByEmail } = await supabase
-            .from('users')
-            .select('*')
-            .eq('email', email)
-            .single();
+          const { rows: existingByEmail } = await pool.query(
+            'SELECT * FROM users WHERE email = $1',
+            [email]
+          );
 
-          if (existingByEmail) {
-            return existingByEmail;
+          if (existingByEmail.length > 0) {
+            return existingByEmail[0];
           }
         }
       }
-      throw new Error(error.message || 'Failed to create user profile');
+      throw new Error(insertError.message || 'Failed to create user profile');
     }
-
-    return data;
   } catch (error) {
     throw error;
   }
@@ -137,20 +108,17 @@ async function createUserProfile(userId, email) {
  */
 async function getUserCompany(userId) {
   try {
-    const supabase = getSupabase();
+    const pool = getPool();
 
-    const { data, error } = await supabase
-      .from('user_customers')
-      .select('customer_id, customers(id, name)')
-      .eq('user_id', userId)
-      .limit(1)
-      .single();
+    const { rows } = await pool.query(
+      `SELECT c.name FROM user_customers uc
+       INNER JOIN customers c ON c.id = uc.customer_id
+       WHERE uc.user_id = $1 LIMIT 1`,
+      [userId]
+    );
 
-    if (error || !data) {
-      return null;
-    }
-
-    return data.customers?.name || null;
+    if (rows.length === 0) return null;
+    return rows[0].name || null;
   } catch (error) {
     console.warn('Could not fetch user company:', error.message);
     return null;
@@ -171,17 +139,14 @@ async function getUserProfile(userId, userEmail = null) {
       return cached.data;
     }
 
-    const supabase = getSupabase();
+    const pool = getPool();
 
-    const { data, error } = await supabase
-      .from('users')
-      .select('*')
-      .eq('id', userId)
-      .single();
+    const { rows } = await pool.query(
+      'SELECT * FROM users WHERE id = $1',
+      [userId]
+    );
 
-    if (error && error.code !== 'PGRST116') {
-      throw new Error(error.message || 'Failed to fetch user profile');
-    }
+    const data = rows[0] || null;
 
     if (!data) {
       // User not found by ID - check if they exist by email (ID may have changed via central auth migration)
@@ -193,14 +158,14 @@ async function getUserProfile(userId, userEmail = null) {
       }
 
       if (email) {
-        const { data: existingByEmail } = await supabase
-          .from('users')
-          .select('*')
-          .eq('email', email)
-          .single();
+        const { rows: emailRows } = await pool.query(
+          'SELECT * FROM users WHERE email = $1',
+          [email]
+        );
+        const existingByEmail = emailRows[0] || null;
 
         if (existingByEmail) {
-          // User exists with a different ID (old Supabase auth vs new central auth)
+          // User exists with a different ID (old auth vs new central auth)
           // Return existing profile as-is — cannot update users.id due to FK constraints from user_roles/user_customers
           console.log(`User found by email ${email} with old ID ${existingByEmail.id} (new auth ID: ${userId})`);
           const company = await getUserCompany(existingByEmail.id);
@@ -282,8 +247,7 @@ function formatUserProfile(data, company = null) {
  */
 async function updateUserProfile(userId, profileData, userEmail = null) {
   try {
-    // Use admin client to bypass RLS policies for updates
-    const supabase = getSupabaseAdmin();
+    const pool = getPool();
 
     // Ensure user profile exists before updating
     let currentProfile;
@@ -291,7 +255,7 @@ async function updateUserProfile(userId, profileData, userEmail = null) {
       currentProfile = await getUserProfile(userId, userEmail);
     } catch (error) {
       // If profile doesn't exist, create it first
-      if (error.message === 'User profile not found' || error.code === 'PGRST116') {
+      if (error.message === 'User profile not found') {
         let email = userEmail;
         if (!email) {
           email = await getUserEmailFromAuth(userId);
@@ -310,7 +274,7 @@ async function updateUserProfile(userId, profileData, userEmail = null) {
     if (profileData.firstName !== undefined || profileData.lastName !== undefined) {
       const firstName = profileData.firstName !== undefined ? profileData.firstName : currentProfile.firstName;
       const lastName = profileData.lastName !== undefined ? profileData.lastName : currentProfile.lastName;
-      
+
       if (firstName || lastName) {
         updateData.full_name = `${firstName || ''} ${lastName || ''}`.trim();
       } else {
@@ -367,31 +331,30 @@ async function updateUserProfile(userId, profileData, userEmail = null) {
     // Update updated_at will be handled by trigger, but we can set it explicitly if needed
     updateData.updated_at = new Date().toISOString();
 
-    // Perform update using admin client.
+    // Perform update.
     // Use the RESOLVED public.users id (currentProfile.id), not the raw central-auth
     // userId. Users created via central auth carry a different public.users id and are
-    // matched by email in getUserProfile(); updating by the central userId matches 0
-    // rows → PostgREST "Cannot coerce the result to a single JSON object".
+    // matched by email in getUserProfile(); updating by the central userId matches 0 rows.
     const targetUserId = currentProfile?.id || userId;
-    const { data, error } = await supabase
-      .from('users')
-      .update(updateData)
-      .eq('id', targetUserId)
-      .select()
-      .single();
 
-    if (error) {
-      console.error('Supabase update error:', error);
-      throw new Error(error.message || 'Failed to update user profile');
-    }
+    // Build dynamic SET clause
+    const keys = Object.keys(updateData);
+    const setClauses = keys.map((key, i) => `${key} = $${i + 1}`);
+    const values = keys.map(key => updateData[key]);
+    values.push(targetUserId);
 
-    if (!data) {
+    const { rows } = await pool.query(
+      `UPDATE users SET ${setClauses.join(', ')} WHERE id = $${values.length} RETURNING *`,
+      values
+    );
+
+    if (rows.length === 0) {
       console.error('Update returned no data for user:', userId);
       throw new Error('User profile not found or update failed');
     }
 
     _invalidateProfileCache(userId);
-    return formatUserProfile(data);
+    return formatUserProfile(rows[0]);
   } catch (error) {
     console.error('Error in updateUserProfile:', error);
     throw error;
@@ -405,19 +368,14 @@ async function updateUserProfile(userId, profileData, userEmail = null) {
  */
 async function userExists(userId) {
   try {
-    const supabase = getSupabase();
-    
-    const { data, error } = await supabase
-      .from('users')
-      .select('id')
-      .eq('id', userId)
-      .single();
+    const pool = getPool();
 
-    if (error && error.code === 'PGRST116') {
-      return false;
-    }
+    const { rows } = await pool.query(
+      'SELECT id FROM users WHERE id = $1 LIMIT 1',
+      [userId]
+    );
 
-    return !!data;
+    return rows.length > 0;
   } catch (error) {
     return false;
   }
@@ -436,26 +394,26 @@ async function userExists(userId) {
  * via central auth carry a different public.users id (matched by email), so callers
  * must not assume req.user.id === public.users.id. Falls back to userId.
  */
-async function resolveUserRowId(supabase, userId, userEmail = null) {
-  const byId = await supabase.from('users').select('id').eq('id', userId).maybeSingle();
-  if (byId.data) return byId.data.id;
+async function resolveUserRowId(pool, userId, userEmail = null) {
+  const { rows: byId } = await pool.query('SELECT id FROM users WHERE id = $1 LIMIT 1', [userId]);
+  if (byId.length > 0) return byId[0].id;
   if (userEmail) {
-    const byEmail = await supabase.from('users').select('id').eq('email', userEmail).maybeSingle();
-    if (byEmail.data) return byEmail.data.id;
+    const { rows: byEmail } = await pool.query('SELECT id FROM users WHERE email = $1 LIMIT 1', [userEmail]);
+    if (byEmail.length > 0) return byEmail[0].id;
   }
   return userId;
 }
 
 async function uploadUserAvatar(userId, fileBuffer, mimeType, originalName, userEmail = null) {
-  const supabase = getSupabaseAdmin();
-  const rowId = await resolveUserRowId(supabase, userId, userEmail);
+  const pool = getPool();
+  const rowId = await resolveUserRowId(pool, userId, userEmail);
 
   // Get current avatar URL to clean up old file
-  const { data: currentUser } = await supabase
-    .from('users')
-    .select('avatar_url')
-    .eq('id', rowId)
-    .maybeSingle();
+  const { rows: currentRows } = await pool.query(
+    'SELECT avatar_url FROM users WHERE id = $1 LIMIT 1',
+    [rowId]
+  );
+  const currentUser = currentRows[0] || null;
 
   // Delete old avatar from storage if it exists in our bucket
   if (currentUser && currentUser.avatar_url && currentUser.avatar_url.includes(AVATARS_BUCKET)) {
@@ -474,20 +432,18 @@ async function uploadUserAvatar(userId, fileBuffer, mimeType, originalName, user
   const { publicUrl } = await uploadAvatarToStorage(rowId, fileBuffer, mimeType, originalName);
 
   // Update avatar_url in the users table
-  const { data, error } = await supabase
-    .from('users')
-    .update({ avatar_url: publicUrl, updated_at: new Date().toISOString() })
-    .eq('id', rowId)
-    .select()
-    .single();
+  const { rows } = await pool.query(
+    'UPDATE users SET avatar_url = $1, updated_at = $2 WHERE id = $3 RETURNING *',
+    [publicUrl, new Date().toISOString(), rowId]
+  );
 
-  if (error) {
-    throw new Error(error.message || 'Failed to update avatar URL');
+  if (rows.length === 0) {
+    throw new Error('Failed to update avatar URL');
   }
 
   _invalidateProfileCache(userId);
   const company = await getUserCompany(rowId);
-  return formatUserProfile(data, company);
+  return formatUserProfile(rows[0], company);
 }
 
 /**
@@ -496,15 +452,15 @@ async function uploadUserAvatar(userId, fileBuffer, mimeType, originalName, user
  * @returns {Object} Updated user profile
  */
 async function removeUserAvatar(userId, userEmail = null) {
-  const supabase = getSupabaseAdmin();
-  const rowId = await resolveUserRowId(supabase, userId, userEmail);
+  const pool = getPool();
+  const rowId = await resolveUserRowId(pool, userId, userEmail);
 
   // Get current avatar URL
-  const { data: currentUser } = await supabase
-    .from('users')
-    .select('avatar_url')
-    .eq('id', rowId)
-    .maybeSingle();
+  const { rows: currentRows } = await pool.query(
+    'SELECT avatar_url FROM users WHERE id = $1 LIMIT 1',
+    [rowId]
+  );
+  const currentUser = currentRows[0] || null;
 
   // Delete from storage if it exists in our bucket
   if (currentUser && currentUser.avatar_url && currentUser.avatar_url.includes(AVATARS_BUCKET)) {
@@ -519,20 +475,18 @@ async function removeUserAvatar(userId, userEmail = null) {
   }
 
   // Clear avatar_url in database
-  const { data, error } = await supabase
-    .from('users')
-    .update({ avatar_url: null, updated_at: new Date().toISOString() })
-    .eq('id', rowId)
-    .select()
-    .single();
+  const { rows } = await pool.query(
+    'UPDATE users SET avatar_url = NULL, updated_at = $1 WHERE id = $2 RETURNING *',
+    [new Date().toISOString(), rowId]
+  );
 
-  if (error) {
-    throw new Error(error.message || 'Failed to remove avatar');
+  if (rows.length === 0) {
+    throw new Error('Failed to remove avatar');
   }
 
   _invalidateProfileCache(userId);
   const company = await getUserCompany(rowId);
-  return formatUserProfile(data, company);
+  return formatUserProfile(rows[0], company);
 }
 
 module.exports = {

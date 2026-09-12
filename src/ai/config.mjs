@@ -9,7 +9,7 @@
  * AI Assistant keeps working exactly as before.
  */
 
-import { supabaseServer } from "./_supabase.mjs";
+import pool from "./_db.mjs";
 import { decrypt } from "./encryption.mjs";
 import { MODELS, DEFAULT_MODEL_ID } from "./models.mjs";
 
@@ -27,15 +27,14 @@ export function defaultAiConfig() {
 /** Load the singleton config row. Never throws — returns defaults on any error. */
 export async function getAiConfig() {
   try {
-    const { data, error } = await supabaseServer
-      .from("ai_config")
-      .select(
-        "enabled_model_ids, default_model_id, monthly_token_budget, budget_enforced",
-      )
-      .eq("id", 1)
-      .maybeSingle();
+    const { rows } = await pool.query(
+      `SELECT enabled_model_ids, default_model_id, monthly_token_budget, budget_enforced
+       FROM ai_config
+       WHERE id = 1`,
+    );
+    const data = rows[0] || null;
 
-    if (error || !data) return defaultAiConfig();
+    if (!data) return defaultAiConfig();
 
     const enabled =
       Array.isArray(data.enabled_model_ids) && data.enabled_model_ids.length > 0
@@ -91,15 +90,12 @@ function envProviderKeys() {
 
 async function readProviderKeyRow() {
   try {
-    const { data, error } = await supabaseServer
-      .from("ai_provider_keys")
-      .select(
-        "google_api_key, anthropic_api_key, azure_api_key, azure_resource_name, azure_deployment",
-      )
-      .eq("id", 1)
-      .maybeSingle();
-    if (error || !data) return null;
-    return data;
+    const { rows } = await pool.query(
+      `SELECT google_api_key, anthropic_api_key, azure_api_key, azure_resource_name, azure_deployment
+       FROM ai_provider_keys
+       WHERE id = 1`,
+    );
+    return rows[0] || null;
   } catch {
     return null;
   }
@@ -160,16 +156,14 @@ export async function getMonthToDateTokens() {
       Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1),
     ).toISOString();
 
-    const { data, error } = await supabaseServer
-      .from("ai_token_usage")
-      .select("total_tokens")
-      .gte("created_at", monthStart);
-
-    if (error || !data) return 0;
-    return data.reduce(
-      (sum, row) => sum + (Number(row.total_tokens) || 0),
-      0,
+    const { rows } = await pool.query(
+      `SELECT COALESCE(SUM(total_tokens), 0) AS total
+       FROM ai_token_usage
+       WHERE created_at >= $1`,
+      [monthStart],
     );
+
+    return Number(rows[0]?.total) || 0;
   } catch {
     return 0;
   }
@@ -200,15 +194,14 @@ export async function getTokenBank(
   scopeId = "",
 ) {
   try {
-    const { data, error } = await supabaseServer
-      .from("ai_token_bank")
-      .select(
-        "scope, scope_id, monthly_allotment, bonus_tokens, enforced, period_start",
-      )
-      .eq("scope", scope)
-      .eq("scope_id", scopeId)
-      .maybeSingle();
-    if (error || !data) return null;
+    const { rows } = await pool.query(
+      `SELECT scope, scope_id, monthly_allotment, bonus_tokens, enforced, period_start
+       FROM ai_token_bank
+       WHERE scope = $1 AND scope_id = $2`,
+      [scope, scopeId],
+    );
+    const data = rows[0] || null;
+    if (!data) return null;
 
     let bonus = Number(data.bonus_tokens) || 0;
     const periodStart = currentPeriodStart();
@@ -218,17 +211,14 @@ export async function getTokenBank(
     if (storedPeriod && storedPeriod < periodStart) {
       const resetBonus = bonus !== 0;
       bonus = 0;
-      void supabaseServer
-        .from("ai_token_bank")
-        .update({
-          ...(resetBonus ? { bonus_tokens: 0 } : {}),
-          period_start: periodStart,
-        })
-        .eq("scope", scope)
-        .eq("scope_id", scopeId)
-        .then(({ error: e }) => {
-          if (e) console.warn("[ai_token_bank] period reset failed:", e.message);
-        });
+      pool.query(
+        `UPDATE ai_token_bank
+         SET ${resetBonus ? "bonus_tokens = 0, " : ""}period_start = $1
+         WHERE scope = $2 AND scope_id = $3`,
+        [periodStart, scope, scopeId],
+      ).catch((e) => {
+        console.warn("[ai_token_bank] period reset failed:", e.message);
+      });
     }
 
     return {

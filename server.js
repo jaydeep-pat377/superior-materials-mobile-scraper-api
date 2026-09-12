@@ -1,23 +1,11 @@
-// Polyfill global WebSocket for Node < 22 (required by @supabase/realtime-js,
-// which throws at client construction when no WebSocket constructor exists).
-// No-op on Node 22+ where WebSocket is built in. Must run before any require
-// that creates a Supabase client.
-if (typeof globalThis.WebSocket === 'undefined') {
-  try {
-    globalThis.WebSocket = require('ws');
-  } catch (e) {
-    console.warn('⚠️  ws package not available for WebSocket polyfill:', e.message);
-  }
-}
-
 const app = require('./app');
-const { getSupabase } = require('./src/config/database');
 const { testConnection, closePool } = require('./src/services/database/postgresClient');
 const { runWorkerLoop } = require('./src/services/queueProcessorService');
 const {
   startChatRealtimeListener,
   stopChatRealtimeListener,
 } = require('./src/services/chatRealtimeListener');
+const { initRealtime } = require('./src/services/realtimeService');
 const { startPlantWeatherWorker } = require('./src/workers/plantWeatherWorker');
 
 const PORT = process.env.PORT || 3000;
@@ -45,32 +33,20 @@ process.on('unhandledRejection', (reason, promise) => {
 
 // Test database connections
 async function testConnections() {
-  // Test Supabase connection
-  try {
-    const supabase = getSupabase();
-    console.log('✓ Supabase client initialized successfully');
-  } catch (err) {
-    if (err.message.includes('not configured')) {
-      console.log('⚠️  Supabase not configured - server will start but database features will be unavailable');
-    } else {
-      console.log('⚠️  Supabase initialization failed:', err.message);
-    }
-  }
-
-  // Test PostgreSQL connection (if configured)
+  // Test PostgreSQL connection
   if (process.env.DATABASE_URL) {
     try {
       const dbConnected = await testConnection();
       if (dbConnected) {
         console.log('✓ PostgreSQL database connected successfully');
       } else {
-        console.log('⚠️  PostgreSQL database connection failed - scraper features may be unavailable');
+        console.log('⚠️  PostgreSQL database connection failed - some features may be unavailable');
       }
     } catch (err) {
       console.log('⚠️  PostgreSQL connection test failed:', err.message);
     }
   } else {
-    console.log('⚠️  DATABASE_URL not configured - scraper features will be unavailable');
+    console.log('⚠️  DATABASE_URL not configured - database features will be unavailable');
   }
 }
 
@@ -104,7 +80,7 @@ const server = app.listen(PORT, async () => {
   console.log('🔧 Scraper API:');
   console.log(`   POST http://localhost:${PORT}/api/scraped-orders/ingest`);
   console.log('═══════════════════════════════════════════════════════');
-  
+
   await testConnections();
 
   // Start embedded worker if --worker flag is passed
@@ -115,12 +91,26 @@ const server = app.listen(PORT, async () => {
     console.log(`   Polling every ${WORKER_POLL_INTERVAL}ms`);
   }
 
-  // Start the chat realtime listener (Supabase realtime → FCM fan-out).
+  // Start the chat realtime listener (PostgreSQL LISTEN → FCM fan-out).
   // Runs on every dyno; cheap (just websocket subscriptions).
-  try {
-    startChatRealtimeListener();
-  } catch (err) {
-    console.error('❌ Failed to start chat realtime listener:', err.message);
+  // Skip in local dev when DISABLE_REALTIME=true (persistent PG connections
+  // are incompatible with kubectl port-forward which dies after each connection).
+  if (process.env.DISABLE_REALTIME === 'true') {
+    console.log('⏭️  Realtime listeners disabled (DISABLE_REALTIME=true)');
+  } else {
+    try {
+      startChatRealtimeListener();
+    } catch (err) {
+      console.error('❌ Failed to start chat realtime listener:', err.message);
+    }
+
+    // Start PostgreSQL LISTEN/NOTIFY → Socket.io realtime
+    try {
+      await initRealtime(server);
+      console.log('🔌 Realtime (PG LISTEN/NOTIFY + Socket.io) started');
+    } catch (err) {
+      console.error('⚠️  Realtime init failed:', err.message);
+    }
   }
 
   // Start plant weather worker (fetches weather every 30 min for all plants)
@@ -193,4 +183,3 @@ server.on('error', (error) => {
       throw error;
   }
 });
-

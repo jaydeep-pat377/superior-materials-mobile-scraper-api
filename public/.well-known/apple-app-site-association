@@ -1,0 +1,11 @@
+{
+  "applinks": {
+    "apps": [],
+    "details": [
+      {
+        "appID": "R9AMT62UA5.truckast.com",
+        "paths": ["/dl/*"]
+      }
+    ]
+  }
+}

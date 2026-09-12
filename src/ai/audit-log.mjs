@@ -9,7 +9,7 @@
  */
 
 import { AsyncLocalStorage } from "node:async_hooks";
-import { supabaseServer } from "./_supabase.mjs";
+import pool from "./_db.mjs";
 
 const auditStorage = new AsyncLocalStorage();
 
@@ -65,23 +65,23 @@ export function withAuditLog(
       throw err;
     } finally {
       const latencyMs = Date.now() - startedAt;
-      void supabaseServer
-        .from("ai_audit_log")
-        .insert({
-          user_id: ctx.userId ?? null,
-          thread_id: ctx.threadId ?? null,
-          question: ctx.question ?? null,
-          tool_name: toolName,
-          tool_input: input,
-          output_row_count: outputRowCount,
-          latency_ms: latencyMs,
-          error: errorMessage,
-        })
-        .then(({ error }) => {
-          if (error) {
-            console.warn(`[ai_audit_log] insert failed for ${toolName}:`, error.message);
-          }
-        });
+      pool.query(
+        `INSERT INTO ai_audit_log
+           (user_id, thread_id, question, tool_name, tool_input, output_row_count, latency_ms, error)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+        [
+          ctx.userId ?? null,
+          ctx.threadId ?? null,
+          ctx.question ?? null,
+          toolName,
+          JSON.stringify(input),
+          outputRowCount,
+          latencyMs,
+          errorMessage,
+        ],
+      ).catch((err) => {
+        console.warn(`[ai_audit_log] insert failed for ${toolName}:`, err.message);
+      });
     }
   };
   return wrapped;

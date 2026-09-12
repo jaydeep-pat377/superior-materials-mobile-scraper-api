@@ -5,7 +5,7 @@ import {
   executeAggregate,
 } from "./query-executor.mjs";
 import { BLOCKED_TABLES } from "./sql-safety.mjs";
-import { supabaseServer } from "./_supabase.mjs";
+import pool from "./_db.mjs";
 import { resolveRelativeDateRange } from "./date-resolver.mjs";
 import { withAuditLog } from "./audit-log.mjs";
 import { model } from "./provider.mjs";
@@ -1226,16 +1226,11 @@ export const tools = {
 
       try {
         if (tableName) {
-          const { data, error } = await supabaseServer
-            .from(tableName)
-            .select("*")
-            .limit(1);
+          const { rows } = await pool.query(
+            `SELECT * FROM "${tableName}" LIMIT 1`,
+          );
 
-          if (error) {
-            return { success: false, error: error.message };
-          }
-
-          const columns = data && data.length > 0 ? Object.keys(data[0]) : [];
+          const columns = rows && rows.length > 0 ? Object.keys(rows[0]) : [];
           return { success: true, table: tableName, columns };
         }
 

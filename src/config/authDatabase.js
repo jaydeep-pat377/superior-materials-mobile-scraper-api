@@ -1,72 +1,42 @@
 /**
- * Auth Supabase Database Configuration
+ * Auth Database Configuration
  *
- * Separate Supabase instance for authentication operations.
+ * Separate PostgreSQL pool for authentication operations.
  * Uses auth_tenant schema for tenants, users, auth_codes, etc.
  */
 
-const { createClient } = require('@supabase/supabase-js');
+const pg = require('pg');
+const { Pool } = pg;
 
-// Auth Supabase configuration (separate from main app database)
-const authSupabaseUrl = process.env.AUTH_SUPABASE_URL;
-const authSupabaseAnonKey = process.env.AUTH_SUPABASE_ANON_KEY;
-const authSupabaseServiceKey = process.env.AUTH_SUPABASE_SERVICE_KEY;
+const AUTH_DATABASE_URL = process.env.AUTH_DATABASE_URL;
 
-let authSupabase = null; // Regular client (uses anon key, respects RLS)
-let authSupabaseAdmin = null; // Admin client (uses service key, bypasses RLS)
+let authPool = null;
 
-// Initialize regular Auth Supabase client
-if (authSupabaseUrl && authSupabaseAnonKey &&
-    authSupabaseUrl !== 'your_auth_supabase_url' &&
-    authSupabaseAnonKey !== 'your_auth_supabase_anon_key') {
-  authSupabase = createClient(authSupabaseUrl, authSupabaseAnonKey, {
-    db: {
-      schema: 'auth_tenant'
-    }
+if (AUTH_DATABASE_URL) {
+  authPool = new Pool({
+    connectionString: AUTH_DATABASE_URL,
+    min: 2,
+    max: 10,
+    idleTimeoutMillis: 60000,
+    connectionTimeoutMillis: 15000,
+    statement_timeout: 30000,
+    ssl: AUTH_DATABASE_URL.includes('localhost') ? false : { rejectUnauthorized: false }
+  });
+
+  authPool.on('error', (err) => {
+    console.error('Auth PostgreSQL pool error:', err.message || err);
   });
 } else {
-  console.warn('⚠️  Auth Supabase credentials not configured. Please update your .env file with AUTH_SUPABASE_URL and AUTH_SUPABASE_ANON_KEY.');
+  console.warn('⚠️  AUTH_DATABASE_URL not configured - auth features will be unavailable');
 }
 
-// Initialize admin Auth Supabase client (with service key for admin operations)
-if (authSupabaseUrl && authSupabaseServiceKey &&
-    authSupabaseUrl !== 'your_auth_supabase_url' &&
-    authSupabaseServiceKey !== 'your_auth_supabase_service_key') {
-  authSupabaseAdmin = createClient(authSupabaseUrl, authSupabaseServiceKey, {
-    auth: {
-      autoRefreshToken: false,
-      persistSession: false
-    },
-    db: {
-      schema: 'auth_tenant'
-    }
-  });
-} else if (authSupabase) {
-  // Fallback to anon key if service key not available (for development)
-  console.warn('⚠️  AUTH_SUPABASE_SERVICE_KEY not configured. Using anon key for admin operations (may fail with RLS).');
-  authSupabaseAdmin = authSupabase;
-}
-
-/**
- * Get Auth Supabase client (regular, respects RLS)
- * @returns {Object} Supabase client for auth_tenant schema
- * @throws {Error} If not configured
- */
-/**
- * Get Auth Supabase admin client (bypasses RLS)
- * @returns {Object} Supabase admin client for auth_tenant schema
- * @throws {Error} If not configured
- */
-function getAuthSupabaseAdmin() {
-  if (!authSupabaseAdmin) {
-    console.error('[AuthDB] Auth Supabase admin client is not configured!');
-    console.error('[AuthDB] AUTH_SUPABASE_URL:', process.env.AUTH_SUPABASE_URL ? 'SET' : 'NOT SET');
-    console.error('[AuthDB] AUTH_SUPABASE_SERVICE_KEY:', process.env.AUTH_SUPABASE_SERVICE_KEY ? 'SET' : 'NOT SET');
-    throw new Error('Auth Supabase admin client is not configured. Please set AUTH_SUPABASE_SERVICE_KEY in your .env file.');
+function getAuthPool() {
+  if (!authPool) {
+    throw new Error('Auth database pool is not configured. Please set AUTH_DATABASE_URL in your .env file.');
   }
-  return authSupabaseAdmin;
+  return authPool;
 }
 
 module.exports = {
-  getAuthSupabaseAdmin
+  getAuthPool
 };
