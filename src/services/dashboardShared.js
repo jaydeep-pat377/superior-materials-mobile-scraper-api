@@ -1,7 +1,7 @@
 /**
  * Shared Dashboard Utilities
  *
- * Common functions used by both dashboardService and newDashboardService.
+ * Common functions used by newDashboardService.
  */
 
 const { executeDirectSQL } = require('../utils/postgresExecutor');

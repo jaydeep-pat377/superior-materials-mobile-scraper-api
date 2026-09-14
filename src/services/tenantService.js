@@ -108,12 +108,6 @@ async function getTenantByClientId(clientId) {
     if (tenant.client_secret) {
       decryptedData.client_secret_decrypted = decrypt(tenant.client_secret);
     }
-    if (tenant.supabase_anon_key) {
-      decryptedData.supabase_anon_key_decrypted = decrypt(tenant.supabase_anon_key);
-    }
-    if (tenant.supabase_service_key) {
-      decryptedData.supabase_service_key_decrypted = decrypt(tenant.supabase_service_key);
-    }
   } catch (decryptError) {
     console.error('Failed to decrypt tenant credentials:', decryptError.message);
     // Return without decrypted fields if decryption fails
@@ -184,45 +178,9 @@ async function validateClientCredentials(clientId, clientSecret) {
   };
 }
 
-/**
- * Get tenant's Supabase credentials (decrypted)
- * Used to authenticate against tenant's Supabase instance
- * @param {number} tenantId - Tenant ID
- * @returns {Object|null} Decrypted Supabase credentials
- */
-async function getTenantSupabaseCredentials(tenantId) {
-  const authPool = getAuthPool();
-
-  const { rows } = await authPool.query(
-    `SELECT supabase_url, supabase_anon_key, supabase_service_key
-     FROM auth_tenant.tenants
-     WHERE id = $1 AND deleted_at IS NULL
-     LIMIT 1`,
-    [tenantId]
-  );
-
-  if (!rows || rows.length === 0) {
-    return null;
-  }
-
-  const tenant = rows[0];
-
-  try {
-    return {
-      supabase_url: tenant.supabase_url,
-      supabase_anon_key: tenant.supabase_anon_key ? decrypt(tenant.supabase_anon_key) : null,
-      supabase_service_key: tenant.supabase_service_key ? decrypt(tenant.supabase_service_key) : null
-    };
-  } catch (decryptError) {
-    console.error('Failed to decrypt tenant Supabase credentials:', decryptError.message);
-    return null;
-  }
-}
-
 module.exports = {
   getTenantBySubdomain,
   getTenantById,
   getTenantByClientId,
-  validateClientCredentials,
-  getTenantSupabaseCredentials
+  validateClientCredentials
 };

@@ -40,10 +40,10 @@ spec:
             - secretRef:
                 name: dolese-api-auth        # auth signing keys (created separately)
             - secretRef:
-                name: dolese-api-supabase-auth  # k8s Secret name — do not rename without
-                                                # updating the live Secret. Provides
-                                                # AUTH_DATABASE_URL / SERVICE_KEY for the
-                                                # shared central-auth (auth_tenant schema).
+                name: dolese-api-supabase-auth  # k8s Secret name (legacy naming) — do not
+                                                # rename without updating the live Secret.
+                                                # Provides AUTH_DATABASE_URL for the shared
+                                                # central-auth (auth_tenant schema).
           env:
             - name: PORT
               value: "3000"
