@@ -7,6 +7,7 @@ const {
 } = require('./src/services/chatRealtimeListener');
 const { initRealtime } = require('./src/services/realtimeService');
 const { startPlantWeatherWorker } = require('./src/workers/plantWeatherWorker');
+const { startDailyIntelligenceWorker } = require('./src/workers/dailyIntelligenceWorker');
 
 const PORT = process.env.PORT || 3000;
 
@@ -119,6 +120,9 @@ const server = app.listen(PORT, async () => {
   } catch (err) {
     console.error('❌ Failed to start plant weather worker:', err.message);
   }
+
+  // Start Daily Intelligence compute worker (every 5 minutes)
+  startDailyIntelligenceWorker();
 
   console.log('✅ Server ready to accept connections');
   console.log('═══════════════════════════════════════════════════════');
