@@ -119,15 +119,29 @@ app.get('/mobile-api-docs.json', (req, res) => {
 const path = require('path');
 
 // Serve apple-app-site-association without file extension
+// Note: Express 5.x sendFile rejects files without extensions, so use fs.readFileSync
+const fs = require('fs');
 app.get('/.well-known/apple-app-site-association', (req, res) => {
-  res.set('Content-Type', 'application/json');
-  res.sendFile(path.join(__dirname, 'public', '.well-known', 'apple-app-site-association'));
+  try {
+    const filePath = path.join(__dirname, 'public', '.well-known', 'apple-app-site-association');
+    const content = fs.readFileSync(filePath, 'utf8');
+    res.set('Content-Type', 'application/json');
+    res.send(content);
+  } catch (err) {
+    res.status(404).json({ success: false, message: 'apple-app-site-association not found' });
+  }
 });
 
 // Serve Android assetlinks.json
 app.get('/.well-known/assetlinks.json', (req, res) => {
-  res.set('Content-Type', 'application/json');
-  res.sendFile(path.join(__dirname, 'public', '.well-known', 'assetlinks.json'));
+  try {
+    const filePath = path.join(__dirname, 'public', '.well-known', 'assetlinks.json');
+    const content = fs.readFileSync(filePath, 'utf8');
+    res.set('Content-Type', 'application/json');
+    res.send(content);
+  } catch (err) {
+    res.status(404).json({ success: false, message: 'assetlinks.json not found' });
+  }
 });
 
 // Serve public PDF documents (NRMCA CIP guides) for mobile clients

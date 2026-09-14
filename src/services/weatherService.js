@@ -658,8 +658,17 @@ async function getAllWeatherData(orderCode, orderDate) {
     SELECT
       o.order_id,
       o.order_code,
-      o.weather_data
+      o.weather_data,
+      pw.temperature_fahrenheit,
+      pw.humidity,
+      pw.wind_speed,
+      pw.weather_condition,
+      pw.weather_icon,
+      pw.weather_description,
+      pw.fetched_at as weather_fetched_at
     FROM orders o
+    LEFT JOIN plants p ON p.code = o.pricing_plant_code
+    LEFT JOIN plant_weather pw ON pw.plant_id::text = p.id::text
     WHERE TRIM(o.order_code) = $1
       AND o.order_date >= $2::date
       AND o.order_date < ($2::date + INTERVAL '1 day')
@@ -681,11 +690,25 @@ async function getAllWeatherData(orderCode, orderDate) {
       };
     }
 
+    // Use orders.weather_data if available, otherwise build from plant_weather
+    let weatherData = order.weather_data || null;
+    if (!weatherData && order.temperature_fahrenheit) {
+      weatherData = {
+        temperature_fahrenheit: parseFloat(order.temperature_fahrenheit),
+        humidity: order.humidity,
+        wind_speed_mph: parseFloat(order.wind_speed) || 0,
+        condition: order.weather_condition,
+        icon: order.weather_icon,
+        description: order.weather_description,
+        fetched_at: order.weather_fetched_at
+      };
+    }
+
     return {
       order_id: order.order_id,
       order_code: order.order_code,
       order_date: orderDate,
-      weather_data: order.weather_data || null
+      weather_data: weatherData
     };
   } catch (error) {
     console.error('Error fetching weather data from orders table:', error);
