@@ -126,7 +126,7 @@ async function sendMessage(req, res) {
       `INSERT INTO chat_messages (order_id, chat_id, sender_id, sender_name, sender_role, message_text, attachments, timeline_visible, is_deleted, created_at, updated_at)
        VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, false, NOW(), NOW())
        RETURNING *`,
-      [order_id, chat_id, sender_id, sender_name || 'User', sender_role || 'user', message_text, JSON.stringify(attachments || []), timeline_visible ?? false]
+      [order_id, chat_id, sender_id, sender_name || 'User', sender_role || 'contractor', message_text, JSON.stringify(attachments || []), timeline_visible ?? false]
     );
 
     // Update order_chats last_message_at
