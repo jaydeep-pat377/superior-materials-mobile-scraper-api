@@ -66,7 +66,7 @@ function initSocketIO(httpServer) {
  * must point at the direct PostgreSQL host (pm-postgres-rw).
  */
 async function startPgListener() {
-  const rawConnStr = process.env.REALTIME_DATABASE_URL || process.env.DATABASE_URL;
+  const rawConnStr = process.env.REALTIME_DATABASE_URL || process.env.DATABASE_DIRECT_URL || process.env.DB_POOL_URL || process.env.DATABASE_URL;
   if (!rawConnStr) {
     console.warn('[Realtime] DATABASE_URL not set — skipping PG listener');
     return;

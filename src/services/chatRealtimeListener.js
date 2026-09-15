@@ -62,13 +62,22 @@ function loadTenantConfigs() {
     }
   }
 
-  // Auto-include the primary DATABASE_URL if not already present
-  if (process.env.DATABASE_URL) {
-    const exists = configs.find((c) => c.database_url === process.env.DATABASE_URL);
+  // Auto-include the primary database if not already present.
+  // LISTEN/NOTIFY requires a direct PostgreSQL connection — PgBouncer in
+  // transaction-pooling mode silently drops notifications.  Prefer
+  // DATABASE_DIRECT_URL or DB_POOL_URL (which, despite the name, is the
+  // non-pooled connection in this stack) over DATABASE_URL.
+  const directUrl =
+    process.env.DATABASE_DIRECT_URL ||
+    process.env.DB_POOL_URL ||
+    process.env.DATABASE_URL;
+
+  if (directUrl) {
+    const exists = configs.find((c) => c.database_url === directUrl);
     if (!exists) {
       configs.push({
         label: 'primary',
-        database_url: process.env.DATABASE_URL,
+        database_url: directUrl,
         subdomains: [],
       });
     }
