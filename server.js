@@ -8,6 +8,7 @@ const {
 const { initRealtime } = require('./src/services/realtimeService');
 const { startPlantWeatherWorker } = require('./src/workers/plantWeatherWorker');
 const { startDailyIntelligenceWorker } = require('./src/workers/dailyIntelligenceWorker');
+const { startOrderAlertWorker } = require('./src/workers/orderAlertWorker');
 
 const PORT = process.env.PORT || 3000;
 
@@ -123,6 +124,9 @@ const server = app.listen(PORT, async () => {
 
   // Start Daily Intelligence compute worker (every 5 minutes)
   startDailyIntelligenceWorker();
+
+  // Start Order Alert worker (late, new, delayed, stuck, cancelled, completed)
+  startOrderAlertWorker();
 
   console.log('✅ Server ready to accept connections');
   console.log('═══════════════════════════════════════════════════════');
