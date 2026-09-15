@@ -174,6 +174,13 @@ async function handleInsert(config, payload) {
       return;
     }
 
+    // Dedup: atomically claim this message so only one pod sends FCM.
+    const { rowCount } = await pool.query(
+      'UPDATE chat_messages SET push_sent_at = NOW() WHERE id = $1 AND push_sent_at IS NULL',
+      [row.id],
+    );
+    if (rowCount === 0) return; // another pod already claimed it
+
     const [recipients, orderMeta] = await Promise.all([
       fetchActiveRecipients(pool, row.sender_id),
       fetchOrderMeta(pool, row.order_id),
@@ -226,6 +233,13 @@ async function handleOrderEntityInsert(config, payload) {
       console.error(`[ChatRealtime][${config.label}] no query pool available`);
       return;
     }
+
+    // Dedup: atomically claim this message so only one pod sends FCM.
+    const { rowCount } = await pool.query(
+      'UPDATE order_entity_messages SET push_sent_at = NOW() WHERE id = $1 AND push_sent_at IS NULL',
+      [row.id],
+    );
+    if (rowCount === 0) return; // another pod already claimed it
 
     const [recipients, meta] = await Promise.all([
       fetchActiveRecipients(pool, row.sender_id),
