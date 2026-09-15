@@ -24,6 +24,7 @@ const { getNotificationPool } = require('../config/notificationDatabase');
 
 const POLL_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
 const TARGET_USER_ID = process.env.ORDER_ALERT_USER_ID || 'a05892d9-6d78-40ec-9bf6-30c1ad59d462';
+const TARGET_TENANT_ID = parseInt(process.env.ORDER_ALERT_TENANT_ID || process.env.TENANT_ID || '42', 10);
 
 /**
  * DB-level dedup: check notification_queue to see if this (event_code, entity_id)
@@ -88,9 +89,9 @@ async function queueNotification(eventCode, entityId, subject, body, orderCode, 
     const pool = getNotificationPool();
     await pool.query(
       `INSERT INTO notification_queue
-        (queue_uuid, channel_code, user_id, event_code, event_name, entity_type, entity_id, subject, body, priority, status, order_code, order_date)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
-      [crypto.randomUUID(), 'push', TARGET_USER_ID, eventCode, eventCode.replace(/_/g, ' '),
+        (queue_uuid, channel_code, user_id, tenant_id, event_code, event_name, entity_type, entity_id, subject, body, priority, status, order_code, order_date)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`,
+      [crypto.randomUUID(), 'push', TARGET_USER_ID, TARGET_TENANT_ID, eventCode, eventCode.replace(/_/g, ' '),
        'order', entityId, subject, body, 1, 'sent', orderCode || null, orderDate || null]
     );
   } catch (err) {

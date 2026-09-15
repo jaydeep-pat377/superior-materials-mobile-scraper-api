@@ -142,7 +142,7 @@ async function sendOrderNotification(req, res) {
 
     // Defaults from Bearer token; body values override
     const targetUserId = user_id || req.user?.id;
-    const effectiveTenantId = tenant_id ?? req.user?.metadata?.tenant?.tenant_id ?? null;
+    const effectiveTenantId = tenant_id ?? req.user?.metadata?.tenant?.tenant_id ?? (parseInt(process.env.TENANT_ID, 10) || null);
 
     if (!targetUserId) {
       return res.status(400).json({ success: false, message: 'Could not resolve user_id from token' });
