@@ -13,14 +13,20 @@ async function getNotifications(userId, tenantId, page = 1, limit = 50) {
 
   const offset = (page - 1) * limit;
 
+  // When tenant_id is null/undefined, return all notifications for the user
+  const whereTenant = tenantId != null ? 'AND tenant_id = $2' : '';
+  const params = tenantId != null ? [userId, tenantId] : [userId];
+  const limitIdx = params.length + 1;
+  const offsetIdx = params.length + 2;
+
   const [dataResult, countResult] = await Promise.all([
     pool.query(
-      'SELECT * FROM notification_queue WHERE user_id = $1 AND tenant_id = $2 ORDER BY created_at DESC LIMIT $3 OFFSET $4',
-      [userId, tenantId, limit, offset]
+      `SELECT * FROM notification_queue WHERE user_id = $1 ${whereTenant} ORDER BY created_at DESC LIMIT $${limitIdx} OFFSET $${offsetIdx}`,
+      [...params, limit, offset]
     ),
     pool.query(
-      'SELECT COUNT(*) FROM notification_queue WHERE user_id = $1 AND tenant_id = $2',
-      [userId, tenantId]
+      `SELECT COUNT(*) FROM notification_queue WHERE user_id = $1 ${whereTenant}`,
+      params
     )
   ]);
 
